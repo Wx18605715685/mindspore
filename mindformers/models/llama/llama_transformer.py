@@ -16,21 +16,24 @@
 from typing import Tuple, Optional
 import math
 import numpy as np
+import mindspore as ms
 
 try:
     from mindspore._checkparam import Validator
 except ImportError:
     import mindspore._checkparam as Validator
 
-from mindspore import nn, ops, __version__
+from mindspore import nn, ops
 import mindspore.common.dtype as mstype
 from mindspore.common.tensor import Tensor
 from mindspore.common.parameter import Parameter
 from mindspore.context import ParallelMode
 from mindspore.ops import operations as P
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
+
 try:
     from mindspore.nn.layer.flash_attention import FlashAttention
+
     FLASHATTENTION_VALID = True
 except ImportError:
     FLASHATTENTION_VALID = False
@@ -39,8 +42,6 @@ from mindformers.models.llama.llama_layer import LlamaFeedForward, LlamaRMSNorm,
 from mindformers.modules.layers import _check_input_dtype, Linear
 from mindformers.modules.transformer import TransformerOpParallelConfig
 
-from mindformers.tools.utils import is_version_ge
-from mindformers.tools.logger import logger
 
 class LLamaAttention(nn.Cell):
     r"""
@@ -62,7 +63,6 @@ class LLamaAttention(nn.Cell):
                 Should be mstype.float32 or mstype.float16.
             - **param_init_type** (dtype.Number): The parameter initialization type of the module. Default mstype.
                 float32. Should be mstype.float32 or mstype.float16.
-            - **qkv_has_bias** (bool): Whether Q/K/V in attention has bias or not.
             - **use_past** (bool): Use the past state to compute, used for incremental prediction.
                 For example, if we have two words and want to generate the ten more words.
                 We just need to compute the two words' state only once, and generate the next word one by one.
@@ -103,8 +103,9 @@ class LLamaAttention(nn.Cell):
                 ((batch_size, num_heads, head_dim, tgt_seq_length),
                 (batch_size, num_heads, tgt_seq_length, head_dim)).
     """
+
+    # pylint: disable=W0212
     def __init__(self,
-                 batch_size,
                  seq_length,
                  dim: int = 512,
                  n_heads: int = 8,
@@ -113,14 +114,17 @@ class LLamaAttention(nn.Cell):
                  softmax_compute_dtype=mstype.float32,
                  rotary_dtype=mstype.float32,
                  param_init_type=mstype.float32,
-                 qkv_has_bias=False,
                  use_past=False,
                  use_flash_attention=False,
-                 compute_in_2d=False,
+                 is_dynamic=False,
+                 max_cache_length: int = 4096,
                  use_past_shard=False,
+                 use_rope_slice=False,
+                 use_kvcache_mgr=False,
                  parallel_config=TransformerOpParallelConfig()):
         super().__init__()
         self.seq_length = seq_length
+        self.max_cache_length = max_cache_length
         self.hidden_size = dim
         self.n_head = n_heads
         self.head_dim = dim // n_heads
@@ -131,8 +135,9 @@ class LLamaAttention(nn.Cell):
         self.softmax_dtype = softmax_compute_dtype
         self.is_first_iteration = True
         self.use_past = use_past
-        self.compute_in_2d = compute_in_2d
         self.use_flash_attention = use_flash_attention and FLASHATTENTION_VALID
+        self.is_dynamic = is_dynamic
+        self.use_kvcache_mgr = use_kvcache_mgr
 
         if self.hidden_size % self.n_head != 0:
             raise ValueError("For 'MultiHeadAttention', the class variable 'hidden_size' must be a multiple "
@@ -145,20 +150,22 @@ class LLamaAttention(nn.Cell):
                              .format(self.n_kv_head, parallel_config.model_parallel))
 
         self.inv_norm_factor = Tensor(1.0 / math.sqrt(self.head_dim), dtype=compute_dtype)
+        self.cache_length_tensor = Tensor(self.max_cache_length, mstype.int32)
 
-        self.reshape = P.Reshape()
+        self.shape = P.Shape()
+        self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.transpose = P.Transpose()
         self.merger_head_transpose = P.Transpose()
         self.batch_matmul = P.BatchMatMul()
         self.batch_matmul_q_k = P.BatchMatMul(transpose_b=True)
         self.mul = P.Mul()
         self.add = P.Add()
-        self.softmax = nn.Softmax().to_float(softmax_compute_dtype)
+        self.softmax = P.Softmax()
         self.cast = P.Cast()
         self.cast_attn = P.Cast()
         self.tile_kv = P.Tile()
 
-        self.apply_rotary_emb = LlamaRotaryEmbedding(self.head_dim, rotary_dtype)
+        self.apply_rotary_emb = LlamaRotaryEmbedding(self.head_dim, rotary_dtype, use_rope_slice=use_rope_slice)
         self.wo = Linear(in_channels=self.hidden_size,
                          out_channels=self.hidden_size,
                          has_bias=False,
@@ -166,17 +173,17 @@ class LLamaAttention(nn.Cell):
                          param_init_type=param_init_type)
         self.wq = Linear(self.hidden_size,
                          self.hidden_size,
-                         has_bias=qkv_has_bias,
+                         has_bias=False,
                          compute_dtype=compute_dtype,
                          param_init_type=param_init_type)
         self.wk = Linear(self.hidden_size,
                          self.n_kv_head * self.head_dim,
-                         has_bias=qkv_has_bias,
+                         has_bias=False,
                          compute_dtype=compute_dtype,
                          param_init_type=param_init_type)
         self.wv = Linear(self.hidden_size,
                          self.n_kv_head * self.head_dim,
-                         has_bias=qkv_has_bias,
+                         has_bias=False,
                          compute_dtype=compute_dtype,
                          param_init_type=param_init_type)
 
@@ -189,8 +196,8 @@ class LLamaAttention(nn.Cell):
             self.batch_matmul.shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
             self.mul.shard(((dp, mp, 1, 1), ()))
             self.add.shard(((dp, 1, 1, 1), (dp, mp, 1, 1)))
-            self.softmax.softmax.shard(((dp, mp, 1, 1),))
-            self.tile_kv.shard(((dp * mp, 1, 1, 1),))
+            self.softmax.shard(((dp, mp, 1, 1),))
+            self.tile_kv.shard(((dp, mp, 1, 1),))
 
             self.apply_rotary_emb.shard((dp, mp, 1, 1))
             self.wq.shard(((dp, 1), (mp, 1)))
@@ -206,83 +213,136 @@ class LLamaAttention(nn.Cell):
                 self.mul.recompute()
                 self.add.recompute()
                 self.cast_attn.recompute()
-                self.softmax.softmax.recompute()
+                self.softmax.recompute()
                 self.batch_matmul.recompute()
 
-        if not is_version_ge(__version__, "2.2.0"):
-            self.use_flash_attention = False
-            logger.info("Current MindSpore do not support flash attention, please upgrade to 2.2.0 or higher")
         if self.use_flash_attention:
             self.flash_attention = FlashAttention(self.head_dim, n_heads, dp=dp, mp=mp, next_block_num=0,
                                                   high_precision=(softmax_compute_dtype == mstype.float32))
 
+        if self.use_kvcache_mgr:
+            self.prompt_kvcache = P._inner_ops.PromptKVCache().shard(
+                ((dp, mp, 1, 1), (dp, mp, 1, 1), (dp,), (1,), (1,), (1,), (1,)))
+            self.decoder_kvcache = P._inner_ops.DecoderKVCache().shard(
+                ((dp, mp, 1, 1), (dp, mp, 1, 1), (dp,), (1,), (1,), (1,), (1,)))
+            self.kvcache_concat_dim0 = P.Concat(axis=0)
+            self.kvcache_concat_dim2 = P.Concat(axis=2)
+            self.kvcache_pad_tensor = ops.zeros((31,), mstype.int64)
+            self.seq_length_tensor = Tensor([self.seq_length], dtype=ms.int64)
+            self.seq_length_tensor_pad = self.kvcache_concat_dim0((self.seq_length_tensor, self.kvcache_pad_tensor))
+            self.seq_lengt_axis_tensor = Tensor([2], dtype=ms.int64)
+            self.seq_lengt_axis_tensor_pad = self.kvcache_concat_dim0(
+                (self.seq_lengt_axis_tensor, self.kvcache_pad_tensor))
+
         if self.use_past:
             # operators used for state reuse
-            seq_range = np.arange(seq_length).reshape(1, 1, -1)
-            self.range = Tensor(np.tile(seq_range, (batch_size, 1, 1)), mstype.int32)
-            self.expand_dims = P.ExpandDims().shard(((dp, 1, 1),))
+            self.seq_length_tensor = Tensor(self.seq_length, mstype.int32)
+            self.pad_before = Tensor([0, 0, 0, 0, 0], mstype.int32)
+            self.pad_after = Tensor([0, 0], mstype.int32)
+            self.pad_zero = Tensor(0, compute_dtype)
             self.add_past = P.Add().shard(((dp, 1, 1, 1), (dp, 1, 1, 1)))
-            self.equal = P.Equal().shard(((dp, 1, 1), (dp, 1, 1)))
-            self.less = P.Less().shard(((dp, 1, 1), (dp, 1, 1)))
+            self.sub_past = P.Sub()
             self.mul_past = P.Mul().shard(((dp, 1, 1, 1), (dp, 1, 1, 1)))
+            self.div_past = P.Div()
+            self.concat = P.Concat(0)
+            self.pad_past = P.PadV3().shard(((dp, mp, 1, 1), (1,), ()))
+            self.pad = P.PadV3().shard(((dp, mp, 1, 1), (1,), ()))
+            self.slice = P.StridedSlice()
             if use_past_shard:
+                self.slice.shard(((dp, mp, 1, 1),))
                 self.add_past.shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
                 self.mul_past.shard(((dp, mp, 1, 1), (dp, 1, 1, 1)))
 
     def construct(self, x: Tensor, freqs_cis: Tuple[Tensor, Tensor], mask=None,
-                  key_past=None, value_past=None, batch_valid_length=None):
+                  key_past=None, value_past=None, valid_length_vector=None, batch_index=None):
         """Forward process of the MultiHeadAttention"""
         ori_dtype = x.dtype
-        # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
-        x = self.reshape(x, (-1, x.shape[-1]))
+        bs, seq_len, _ = self.shape(x)
+
         # [bs * seq/1, hidden_dim]
         query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
-        key = self.cast(self.wk(x), self.dtype)    # dp, 1 -> dp, mp
+        key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
         value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
-        query = self.reshape(query, (-1, self._get_seq_length_under_incremental(self.seq_length),
-                                     self.n_head, self.head_dim))
-        key = self.reshape(key, (-1, self._get_seq_length_under_incremental(self.seq_length),
-                                 self.n_kv_head, self.head_dim))
-        value = self.reshape(value, (-1, self._get_seq_length_under_incremental(self.seq_length),
-                                     self.n_kv_head, self.head_dim))
-        # [bs, seq/1, n_head/n_kv_head, head_dim]
-        query = self.transpose(query, (0, 2, 1, 3))
-        key = self.transpose(key, (0, 2, 1, 3))
-        value = self.transpose(value, (0, 2, 1, 3))
+        if self.use_past and not self.is_first_iteration:
+            query = self.reshape(query, (bs, self.n_head, 1, self.head_dim))
+            key = self.reshape(key, (bs, self.n_kv_head, 1, self.head_dim))
+            value = self.reshape(value, (bs, self.n_kv_head, 1, self.head_dim))
+        else:
+            query = self.reshape(query, (bs, seq_len, self.n_head, self.head_dim))
+            key = self.reshape(key, (bs, seq_len, self.n_kv_head, self.head_dim))
+            value = self.reshape(value, (bs, seq_len, self.n_kv_head, self.head_dim))
+            # [bs, seq/1, n_head/n_kv_head, head_dim]
+            query = self.transpose(query, (0, 2, 1, 3))
+            key = self.transpose(key, (0, 2, 1, 3))
+            value = self.transpose(value, (0, 2, 1, 3))
         # [bs, n_head/n_kv_head, seq/1, head_dim]
-        query, key = self.apply_rotary_emb(query, key, freqs_cis) # dp, mp, 1, 1
+        query, key = self.apply_rotary_emb(query, key, freqs_cis)  # dp, mp, 1, 1
         # kv cache: [bs, n_kv_head, 1, head_dim] -> [bs, n_kv_head, seq, head_dim]
         key_present = key
         value_present = value
-        if self.use_past:
+        if self.use_kvcache_mgr:
+            # The first graph with the input size of (bs, seq_length)
+            batch_index_pad = self.kvcache_concat_dim0((batch_index, self.kvcache_pad_tensor))
+            if self.is_first_iteration:
+                pad_length = P.Sub()(self.seq_length_tensor, ops.shape(key)[-2]).reshape((1,)).astype(mstype.int32)
+                # calculate padding parameter: (0, 0),(0,0),(0,pad_length),(0,0), append values of 'pad_length' in axis
+                # 'seq_length'
+                key_paddings = self.concat((self.pad_before, pad_length, self.pad_after))
+                val_paddings = self.concat((self.pad_before, pad_length, self.pad_after))
+                key_pad = self.pad(key, key_paddings, self.pad_zero)
+                value_pad = self.pad(value, val_paddings, self.pad_zero)
+                bvl = self.reshape(valid_length_vector, (-1,))
+                self.prompt_kvcache(key_past, key_pad, bvl, batch_index_pad, self.seq_lengt_axis_tensor_pad,
+                                    self.seq_length_tensor_pad, self.seq_length_tensor_pad)
+                self.prompt_kvcache(value_past, value_pad, bvl, batch_index_pad, self.seq_lengt_axis_tensor_pad,
+                                    self.seq_length_tensor_pad, self.seq_length_tensor_pad)
+                key_present = ops.depend(key_present, key_pad)
+                value_present = ops.depend(value_present, value_pad)
+            else:
+                valid_length = valid_length_vector
+                self.decoder_kvcache(key_past, key, valid_length, batch_index_pad, self.seq_lengt_axis_tensor_pad,
+                                     self.seq_length_tensor_pad, self.seq_length_tensor_pad)
+                self.decoder_kvcache(value_past, value, valid_length, batch_index_pad, self.seq_lengt_axis_tensor_pad,
+                                     self.seq_length_tensor_pad, self.seq_length_tensor_pad)
+                key_present = self.slice(key_past, (0, 0, 0, 0), (bs, self.n_kv_head, self.seq_length, self.head_dim),
+                                         (1, 1, 1, 1))
+                value_present = self.slice(value_past, (0, 0, 0, 0),
+                                           (bs, self.n_kv_head, self.seq_length, self.head_dim), (1, 1, 1, 1))
+        elif self.use_past:
             # The first graph with the input size of (bs, seq_length)
             if self.is_first_iteration:
-                # Get the valid input length without padding
-                valid_length_vector = (
-                    self.less(self.range, batch_valid_length.view(-1, 1, 1))).astype(self.dtype)
-                # Cover the key and value numbers corresponding to the padding position
-                key_present = self.mul_past(key, self.expand_dims(valid_length_vector, 3))
-                value_present = self.mul_past(value, self.expand_dims(valid_length_vector, 3))
+                if self.is_dynamic:
+                    max_seq_length = self.div_past(self.cache_length_tensor, bs).reshape((1,)).astype(mstype.int32)
+                    pad_length = self.sub_past(max_seq_length, seq_len).reshape((1,)).astype(mstype.int32)
+                    # calculate padding parameter: (0, 0),(0,0),(0,pad_length),(0,0), append values of 'pad_length' in
+                    # axis 'seq_length'
+                    paddings_config = self.concat((self.pad_before, pad_length, self.pad_after))
+                    key_present = self.pad_past(key, paddings_config, self.pad_zero)
+                    value_present = self.pad_past(value, paddings_config, self.pad_zero)
+                    # Cover the key and value numbers corresponding to the padding position
+                    key_present = self.mul_past(key_present, valid_length_vector)
+                    value_present = self.mul_past(value_present, valid_length_vector)
+                else:
+                    key_present = self.mul_past(key, valid_length_vector)
+                    value_present = self.mul_past(value, valid_length_vector)
             # The second graph with the inpus size of (bs, 1)
             else:
-                # Get the current token position index
-                valid_length = batch_valid_length - 1
-                valid_length = self.reshape(valid_length, (-1, 1, 1))
-                valid_length_vector = (self.equal(self.range, valid_length)).astype(self.dtype)
-                # Pad the key and value to seq_length with only the position index not zero
-                current_key = self.mul_past(key, self.expand_dims(valid_length_vector, 3))
-                current_value = self.mul_past(value, self.expand_dims(valid_length_vector, 3))
-                # Concat the previous saved state and current state
-                key = self.add_past(key_past, current_key)
-                value = self.add_past(value_past, current_value)
-                # Update key_present and value_present for state update
-                key_present = key
-                value_present = value
+                if self.is_dynamic:
+                    key = self.add_past(self.reshape(key_past, (bs, self.n_kv_head, -1, self.head_dim)),
+                                        self.mul_past(key, valid_length_vector))
+                    value = self.add_past(self.reshape(value_past, (bs, self.n_kv_head, -1, self.head_dim)),
+                                          self.mul_past(value, valid_length_vector))
+                    key_present = key
+                    value_present = value
+                else:
+                    key = self.add_past(key_past, self.mul_past(key, valid_length_vector))
+                    value = self.add_past(value_past, self.mul_past(value, valid_length_vector))
+                    key_present = key
+                    value_present = value
 
-        layer_present = (key_present, value_present)
         # kv share: [bs, n_kv_head, seq, head_dim] -> [bs, n_head, seq, head_dim]
-        key = self._repeat_kv(key, self.n_rep)
-        value = self._repeat_kv(value, self.n_rep)
+        key = self._repeat_kv(key_present, self.n_rep)
+        value = self._repeat_kv(value_present, self.n_rep)
         # q, k, v: [bs, n_head, seq/1, head_dim], [bs, n_head, seq, head_dim], [bs, n_head, seq, head_dim]
         if self.use_flash_attention:
             attention = self.flash_attention(query, key, value, mask)
@@ -290,27 +350,19 @@ class LLamaAttention(nn.Cell):
         else:
             attention = self._attn(query, key, value, mask)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
-        output = self.wo(attention) # dp, mp -> dp, 1 / dp * mp, 1
+        output = self.wo(attention)  # dp, mp -> dp, 1 / dp * mp, 1
         output = self.cast(output, ori_dtype)
 
-        return output, layer_present
+        return output
 
     def _repeat_kv(self, x, rep):
         if rep == 1:
             return x
-        bs, n_kv_head, seqlen, head_dim = x.shape
-        x = self.reshape(x, (bs * n_kv_head, 1, seqlen, head_dim))
-        x = self.tile_kv(x, (1, rep, 1, 1))
+        bs, n_kv_head, seqlen, head_dim = self.shape(x)
+        x = self.reshape(x, (bs, n_kv_head, 1, seqlen * head_dim))
+        x = self.tile_kv(x, (1, 1, rep, 1))
         x = self.reshape(x, (bs, n_kv_head * rep, seqlen, head_dim))
         return x
-
-    def _get_seq_length_under_incremental(self, length):
-        r"""Return the length of the tensor.
-            For the incremental prediction, the seq length for the input is 1.
-        """
-        if self.use_past and not self.is_first_iteration:
-            return 1
-        return length
 
     def _merge_heads(self, x):
         """
@@ -323,15 +375,11 @@ class LLamaAttention(nn.Cell):
             x_merge: the 2d output
         """
         # [bs, n_head, seq/1, head_dim]
-        x = self.merger_head_transpose(x, (0, 2, 1, 3)) # dp,mp,1,1 -> dp,1,mp,1
+        x = self.merger_head_transpose(x, (0, 2, 1, 3))  # dp,mp,1,1 -> dp,1,mp,1
         # [bs, seq/1, n_head, head_dim]
-        x_shape = x.shape
-        if self.compute_in_2d:
-            # [bs * seq/1, hidden_dim]
-            new_shape = (-1, x_shape[-2] * x_shape[-1])
-        else:
-            # [bs, seq/1, hidden_dim]
-            new_shape = (x_shape[0], x_shape[1], -1)
+        bs, seq_len, n_head, head_dim = self.shape(x)
+        # [bs, seq/1, hidden_dim]
+        new_shape = (bs, seq_len, n_head * head_dim)
         x_merge = self.reshape(x, new_shape)
         return x_merge
 
@@ -348,15 +396,18 @@ class LLamaAttention(nn.Cell):
         Outputs:
             weighted_values: Tensor, the weighted sum scores
         """
-        # q, k: [bs, n_head, seq/1, head_dim], [bs, n_head, seq, head_dim]
+        # q, k: [bs, n_head, seq/1, head_dim], [bs, n_head, seq/maxseq, head_dim] ==> [bs, n_head, seq/1, seq/maxseq]
         score = self.batch_matmul_q_k(query, key)
         # score: [bs, n_head, seq/1, seq]
         score = self.mul(score, self.inv_norm_factor)
+        # mask: [bs, 1, seq/1, seq/maxseq] [bs, n_head, seq/1, seq/maxseq] ==> [bs, n_head, seq/1, seq/maxseq]
         score = self.add(mask, score)
 
-        attention_probs = self.softmax(self.cast_attn(score, self.softmax_dtype))
-        # score, v: [bs, n_head, seq/1, seq], [bs, n_head, seq, head_dim]
-        weighted_values = self.batch_matmul(self.cast(attention_probs, self.dtype), value)
+        # [bs, n_head, seq/1, seq/maxseq] ==> [bs, n_head, seq/1, seq/maxseq]
+        attention_probs = self.softmax(self.cast_attn(score, self.softmax_dtype))  # 1,32,1,19200
+        # score, v: [bs, n_head, seq/1, seq/maxseq], [bs, n_head, seq/maxseq, head_dim]
+        weighted_values = self.batch_matmul(self.cast(attention_probs, self.dtype),
+                                            value)  # 1,32,1,19200 * 1,32,4096,128
         # [bs, n_head, seq/1, head_dim]
         attention_merge = self._merge_heads(weighted_values)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
@@ -386,7 +437,6 @@ class LLamaDecodeLayer(nn.Cell):
                 Should be mstype.float32 or mstype.float16. Default mstype.float32.
             param_init_type(dtype.Number): The parameter initialization type of the module.
                 Should be mstype.float32 or mstype.float16. Default mstype.float32.
-            qkv_has_bias(bool): Whether Q/K/V in attention has bias or not.
             use_past(bool): Use the past state to compute, used for incremental prediction. For example, if we have two
                 words and want to generate the ten more words. We just need to compute the two words' state only once,
                 and generate the next word one by one. When use_past is True, there are two steps to run the prediction.
@@ -406,8 +456,6 @@ class LLamaDecodeLayer(nn.Cell):
             - **input_mask** (Tensor) - Float Tensor, If the use_past is False or is_first_iteration=True,
               the attention mask matrix should ba [batch_size, seq_length, seq_length], or None. None means there will
               be no mask in softmax computation. Otherwise, should be [batch_size, 1, hidden_size]
-            - **init_reset** (Tensor) - A bool tensor with shape [1], used to clear the past key parameter and
-              past value parameter used in the incremental prediction. Only valid when use_past is True. Default True.
             - **batch_valid_length** (Tensor) - Int32 tensor with shape [batch_size] the past calculated the index.
               Used for incremental prediction when the use_past is True. Default None.
 
@@ -423,6 +471,7 @@ class LLamaDecodeLayer(nn.Cell):
               (batch_size, num_heads, seq_length, head_dim)).
 
     """
+
     def __init__(self,
                  batch_size,
                  seq_length,
@@ -438,18 +487,19 @@ class LLamaDecodeLayer(nn.Cell):
                  softmax_compute_dtype=mstype.float32,
                  rotary_dtype=mstype.float32,
                  param_init_type=mstype.float32,
-                 qkv_has_bias=False,
                  use_past=False,
                  use_flash_attention=False,
-                 compute_in_2d=False,
+                 is_dynamic=False,
+                 max_cache_length: int = 4096,
                  use_past_shard=False,
+                 use_rope_slice=False,
+                 use_kvcache_mgr=False,
                  parallel_config=TransformerOpParallelConfig()):
         super().__init__()
         if batch_size or use_past:
             Validator.check_positive_int(batch_size)
         self.batch_size = batch_size
 
-        self.compute_in_2d = compute_in_2d
         self.seq_length = seq_length
         self.layer_id = layer_id
         self.hidden_size = dim
@@ -460,16 +510,18 @@ class LLamaDecodeLayer(nn.Cell):
         self.dtype = compute_dtype
         self.is_first_iteration = True
         self.use_past = use_past
-        self.compute_in_2d = compute_in_2d
+        self.is_dynamic = is_dynamic
         self.key_past = None
         self.value_past = None
+        self.use_seq_parallel = parallel_config.use_seq_parallel
+        self.use_kvcache_mgr = use_kvcache_mgr
 
-        self.reshape = P.Reshape()
+        self.shape = P.Shape()
+        self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.add = P.Add()
         self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype)
         self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype)
-        self.attention = LLamaAttention(batch_size=batch_size,
-                                        seq_length=seq_length,
+        self.attention = LLamaAttention(seq_length=seq_length,
                                         dim=dim,
                                         n_heads=n_heads,
                                         n_kv_heads=n_kv_heads,
@@ -477,11 +529,13 @@ class LLamaDecodeLayer(nn.Cell):
                                         softmax_compute_dtype=softmax_compute_dtype,
                                         rotary_dtype=rotary_dtype,
                                         param_init_type=param_init_type,
-                                        qkv_has_bias=qkv_has_bias,
                                         use_past=use_past,
                                         use_flash_attention=use_flash_attention,
-                                        compute_in_2d=compute_in_2d,
+                                        is_dynamic=is_dynamic,
+                                        max_cache_length=max_cache_length,
                                         use_past_shard=use_past_shard,
+                                        use_rope_slice=use_rope_slice,
+                                        use_kvcache_mgr=use_kvcache_mgr,
                                         parallel_config=parallel_config)
         self.feed_forward = LlamaFeedForward(dim=self.hidden_size,
                                              hidden_dim=4 * self.hidden_size,
@@ -494,99 +548,57 @@ class LLamaDecodeLayer(nn.Cell):
         mp = parallel_config.model_parallel
         if not (_get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation()):
             self.feed_forward.shard(parallel_config)
-            if self.compute_in_2d:
-                self.add.shard(((dp, 1), (dp, 1)))
-                self.attention_norm.shard((dp, 1))
-                self.ffn_norm.shard((dp, 1))
-            else:
-                self.add.shard(((dp, 1, 1), (dp, 1, 1)))
-                self.attention_norm.shard((dp, 1, 1))
-                self.ffn_norm.shard((dp, 1, 1))
-                self.feed_forward.mul.shard(((dp, 1, mp), (dp, 1, mp)))
+            self.add.shard(((dp, 1, 1), (dp, 1, 1)))
+            self.attention_norm.shard((dp, 1, 1))
+            self.ffn_norm.shard((dp, 1, 1))
+            self.feed_forward.mul.shard(((dp, 1, mp), (dp, 1, mp)))
 
         if parallel_config.use_seq_parallel and self.is_first_iteration:
-            if self.compute_in_2d:
-                self.add.shard(((dp * mp, 1), (dp * mp, 1)))
-                self.attention_norm.shard((dp * mp, 1))
-                self.ffn_norm.shard((dp * mp, 1))
-            else:
-                self.add.shard(((dp, mp, 1), (dp, mp, 1)))
-                self.attention_norm.shard((dp, mp, 1))
-                self.ffn_norm.shard((dp, mp, 1))
+            self.add.shard(((dp, mp, 1), (dp, mp, 1)))
+            self.attention_norm.shard((dp, mp, 1))
+            self.ffn_norm.shard((dp, mp, 1))
             self.feed_forward.w2.shard(((dp, mp), (1, mp)), out_strategy_matmul=((dp * mp, 1),))
 
         if self.use_past:
-            kv_shape = (batch_size, self.n_kv_head, seq_length, self.head_dim)
-            self.key_past = Parameter(Tensor(np.zeros(kv_shape), self.dtype), name="key_past")
-            self.value_past = Parameter(Tensor(np.zeros(kv_shape), self.dtype), name="value_past")
+            print(f"===============> cache shape {self.batch_size}x{self.n_kv_head}x{self.seq_length}x{self.head_dim}",
+                  flush=True)
+            kv_shape = (self.batch_size, self.n_kv_head, self.seq_length, self.head_dim)
+            self.key_past = Parameter(Tensor(np.zeros(kv_shape), self.dtype), name="key_past", requires_grad=False)
+            self.value_past = Parameter(Tensor(np.zeros(kv_shape), self.dtype), name="value_past", requires_grad=False)
+            self.init_false = Tensor([False], mstype.bool_)
             self.mul_past = P.Mul().shard(((dp, 1, 1, 1), (1,)))
             self.assign_past = P.Assign().shard(((dp, 1, 1, 1), (dp, 1, 1, 1)))
             if use_past_shard:
                 self.mul_past.shard(((dp, mp, 1, 1), (1,)))
                 self.assign_past.shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
 
-    def construct(self, x, freqs_cis, mask=None, init_reset=True, batch_valid_length=None):
+    def construct(self, x, freqs_cis, mask=None, valid_length_vector=None, batch_index=None):
         """ Forward of transformer block. """
-        self._check_input(x, freqs_cis, mask, init_reset, batch_valid_length)
-        # [bs, seq/1, hidden_dim] (first) [bs * seq/1, hidden_dim] (others)
-        if self.compute_in_2d and x.ndim != 2:
-            x = self.reshape(x, (-1, x.shape[-1]))
-        # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
+        self._check_input(x, freqs_cis, mask)
+        # [bs, seq/1, hidden_dim]
         input_x = self.attention_norm(x)
 
-        key_reset = None
-        value_reset = None
-        if self.use_past and self.is_first_iteration:
-            # reset states, init_reset True for reuse and False for reset
-            self.assign_past(self.key_past, self.mul_past(self.key_past, self.cast(init_reset, self.dtype)))
-            self.assign_past(self.value_past, self.mul_past(self.value_past, self.cast(init_reset, self.dtype)))
-            key_reset = self.key_past
-            value_reset = self.value_past
-            # add dependency for desired execution order
-            input_x = ops.depend(input_x, key_reset)
-            input_x = ops.depend(input_x, value_reset)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
-        h, layer_present = self.attention(input_x, freqs_cis, mask,
-                                          self.key_past, self.value_past, batch_valid_length)
+        h = self.attention(input_x, freqs_cis, mask,
+                           self.key_past, self.value_past, valid_length_vector, batch_index)
         h = self.add(x, h)
         ffn_norm = self.ffn_norm(h)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
         ffn_out = self.feed_forward(ffn_norm)
 
-        value_update = None
-        key_update = None
-        if self.use_past:
-            # current key and value
-            key_present, value_present = layer_present
-            # update key and value calculated this step
-            self.assign_past(self.key_past, key_present)
-            self.assign_past(self.value_past, value_present)
-            key_update = self.key_past
-            value_update = self.value_past
-            # add dependency for desired execution order
-            key_update = ops.depend(key_update, key_reset)
-            value_update = ops.depend(value_update, value_reset)
-
-        # add dependency for desired execution order
-        ffn_out = ops.depend(ffn_out, value_update)
-        ffn_out = ops.depend(ffn_out, key_update)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
         out = self.add(h, ffn_out)
-        return out, layer_present
+        return out
 
-    def _check_input(self, x, freqs_cis, mask, init_reset, batch_valid_length):
+    def _check_input(self, x, freqs_cis, mask):
         r"""Check inputs"""
         _check_input_dtype(
             x.dtype, "x", [mstype.float32, mstype.float16], self.cls_name)
         freqs_cos, freqs_sin, swap_mask = freqs_cis
         _check_input_dtype(freqs_cos.dtype, "freqs_cos", [mstype.float32, mstype.float16], self.cls_name)
         _check_input_dtype(freqs_sin.dtype, "freqs_sin", [mstype.float32, mstype.float16], self.cls_name)
-        if swap_mask is not None:
-            _check_input_dtype(swap_mask.dtype, "swap_mask", [mstype.float32, mstype.float16], self.cls_name)
+        _check_input_dtype(swap_mask.dtype, "swap_mask", [mstype.float32, mstype.float16], self.cls_name)
         if mask is not None:
             _check_input_dtype(mask.dtype, "input_mask", [mstype.float32, mstype.float16], self.cls_name)
 
-        if self.use_past:
-            _check_input_dtype(init_reset.dtype, "init_reset", [mstype.bool_], self.cls_name)
-            _check_input_dtype(batch_valid_length.dtype, "batch_valid_length", [mstype.int32], self.cls_name)
         return True

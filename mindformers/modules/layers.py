@@ -27,7 +27,6 @@ from mindspore import nn
 from mindspore.common.parameter import Parameter
 from mindspore.common.initializer import initializer, Tensor
 import mindspore.common.dtype as mstype
-from mindspore._extends import cell_attr_register
 from mindspore.nn.cell import Cell
 from mindspore.ops import functional as F
 from mindspore.ops import operations as P
@@ -404,7 +403,6 @@ class Linear(Cell):
         ``Ascend`` ``GPU``
     """
 
-    @cell_attr_register
     @_args_type_validator_check(in_channels=Validator.check_positive_int,
                                 out_channels=Validator.check_positive_int,
                                 has_bias=Validator.check_bool,
@@ -474,16 +472,18 @@ class Linear(Cell):
         self.activation_flag = self.activation is not None
         self.dtype = compute_dtype
         self.cast = P.Cast()
+        self.shape = P.Shape()
+        self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
 
     def construct(self, x):
         """Forward process, x should be a tensor"""
-        out_shape = P.Shape()(x)[:-1] + (self.out_channels,)
-        x = P.Reshape()(x, (-1, self.in_channels))
+        out_shape = self.shape(x)[:-1] + (self.out_channels,)
+        x = self.reshape(x, (-1, self.in_channels))
         if self.expert_flag:
             if self.use_expert_group_size is True:
-                x = P.Reshape()(x, (-1, self.expert_num, self.expert_group_size, self.in_channels))
+                x = self.reshape(x, (-1, self.expert_num, self.expert_group_size, self.in_channels))
             else:
-                x = P.Reshape()(x, (self.outer_batch, self.expert_num, -1, self.in_channels))
+                x = self.reshape(x, (self.outer_batch, self.expert_num, -1, self.in_channels))
         ori_dtype = F.dtype(x)
         weight = self.cast(self.weight, self.dtype)
         x = self.cast(x, self.dtype)
@@ -492,8 +492,8 @@ class Linear(Cell):
             x = self.bias_add(x, self.cast(self.bias, self.dtype))
         if self.activation_flag:
             x = self.activation(x)
-        x = F.cast(x, ori_dtype)
-        output = P.Reshape()(x, out_shape)
+        x = self.cast(x, ori_dtype)
+        output = self.reshape(x, out_shape)
         return output
 
     def shard(self, strategy_matmul, strategy_bias=None, strategy_activation=None, out_strategy_matmul=None):

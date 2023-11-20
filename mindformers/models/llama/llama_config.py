@@ -14,7 +14,6 @@
 # ============================================================================
 """Llama Config API."""
 
-
 from typing import Optional
 from mindformers.modules.transformer.transformer import default_transformer_config, TransformerOpParallelConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
@@ -99,8 +98,8 @@ class LlamaConfig(BaseConfig):
                  hidden_size: int = 4096,
                  num_layers: int = 32,
                  num_heads: int = 32,
-                 vocab_size: int = 32000,   # defined later by tokenizer
-                 multiple_of: int = 256,    # make SwiGLU hidden layer size multiple of large power of 2
+                 vocab_size: int = 32000,  # defined later by tokenizer
+                 multiple_of: int = 256,  # make SwiGLU hidden layer size multiple of large power of 2
                  n_kv_heads: Optional[int] = None,
                  ffn_dim_multiplier: Optional[int] = None,
                  rms_norm_eps: float = 1e-5,
@@ -117,10 +116,13 @@ class LlamaConfig(BaseConfig):
                  use_past: bool = False,
                  pretrain_seqlen: int = 2048,
                  extend_method: str = "None",
-                 compute_in_2d: bool = False,
                  use_flash_attention: bool = False,
+                 is_dynamic: bool = False,
+                 max_cache_length: int = 4096,
                  offset: int = 0,
                  use_past_shard: bool = False,
+                 use_rope_slice: bool = False,
+                 use_kvcache_mgr: bool = False,
                  checkpoint_name_or_path: str = "",
                  repetition_penalty: float = 1.0,
                  max_decode_length: int = 1024,
@@ -153,10 +155,13 @@ class LlamaConfig(BaseConfig):
         self.use_past = use_past
         self.pretrain_seqlen = pretrain_seqlen
         self.extend_method = extend_method
-        self.compute_in_2d = compute_in_2d
         self.use_flash_attention = use_flash_attention
+        self.is_dynamic = is_dynamic
+        self.max_cache_length = max_cache_length
         self.offset = offset
         self.use_past_shard = use_past_shard
+        self.use_rope_slice = use_rope_slice
+        self.use_kvcache_mgr = use_kvcache_mgr
         self.repetition_penalty = repetition_penalty
         self.max_decode_length = max_decode_length
         self.top_k = top_k
