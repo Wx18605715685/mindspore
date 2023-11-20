@@ -55,6 +55,7 @@ class LlamaSiLU(Cell):
         Outputs:
             Tensor. x = x * sigmod(x).
     """
+
     def __init__(self):
         super().__init__()
         self.sigmoid = nn.Sigmoid()
@@ -90,16 +91,16 @@ def precompute_freqs_cis(
         ratio = end / pretrain_seqlen
     if extend_method == SeqExtendMethod.NTK.value:
         theta *= ratio
-    freqs_base = np.arange(0, dim, 2)[: (dim // 2)].astype(np.float32) # (head_dim // 2, )
-    freqs = 1.0 / (theta ** (freqs_base / dim)) # (head_dim // 2, )
+    freqs_base = np.arange(0, dim, 2)[: (dim // 2)].astype(np.float32)  # (head_dim // 2, )
+    freqs = 1.0 / (theta ** (freqs_base / dim))  # (head_dim // 2, )
     if extend_method == SeqExtendMethod.PI.value:
         t = np.arange(0, end / ratio, 1 / ratio).astype(np.float32)
     else:
         t = np.arange(0, end, 1).astype(np.float32)  # type: ignore # (seq_len,)
     freqs = np.outer(t, freqs)  # type: ignore (seq_len, head_dim // 2)
     emb = np.concatenate((freqs, freqs), axis=-1)
-    freqs_cos = np.cos(emb) # (seq_len, head_dim)
-    freqs_sin = np.sin(emb) # (seq_len, head_dim)
+    freqs_cos = np.cos(emb)  # (seq_len, head_dim)
+    freqs_sin = np.sin(emb)  # (seq_len, head_dim)
     freqs_cos = Tensor(freqs_cos, dtype=dtype)
     freqs_sin = Tensor(freqs_sin, dtype=dtype)
 
@@ -124,20 +125,33 @@ class LlamaRotaryEmbedding(Cell):
             Tensor of shape :math:`(batch, seq_length, hidden_size)`.
     """
 
-    def __init__(self, head_dim=128, compute_dtype=mstype.float32):
+    def __init__(self, head_dim=128, compute_dtype=mstype.float32, use_rope_slice=False):
         super().__init__(auto_prefix=False)
+        self.half_head_dim = head_dim // 2
         self.head_dim = head_dim
         self.dtype = compute_dtype
+        self.use_rope_slice = use_rope_slice
 
         self.add = P.Add()
         self.bmm_swap = P.BatchMatMul()
         self.mul = P.Mul()
+        self.neg = P.Neg()
+        self.slice = P.StridedSlice()
+        self.concat = P.Concat(axis=-1)
+        self.shape = P.Shape()
 
         self.cast = P.Cast()
 
     def rotate_half(self, x, swap_mask):
         # [bs, n_head/n_kv_head, seq/1, head_dim], [head_dim, head_dim]
         x = self.bmm_swap(x, swap_mask)
+        return x
+
+    def slice_half(self, x):
+        bs, n_head, seq, _ = self.shape(x)
+        x1 = self.slice(x, (0, 0, 0, 0), (bs, n_head, seq, self.half_head_dim), (1, 1, 1, 1))
+        x2 = self.slice(x, (0, 0, 0, self.half_head_dim), (bs, n_head, seq, self.head_dim), (1, 1, 1, 1))
+        x = self.concat((self.neg(x2), x1))
         return x
 
     def construct(self, xq: Tensor, xk: Tensor, freqs_cis):
@@ -147,10 +161,16 @@ class LlamaRotaryEmbedding(Cell):
         xk = self.cast(xk, self.dtype)
         # xq, xk: [bs, n_head/n_kv_head, seq/1, head_dim]
         freqs_cos, freqs_sin, swap_mask = freqs_cis
-        xq_out = self.add(self.mul(xq, freqs_cos),
-                          self.mul(self.rotate_half(xq, swap_mask), freqs_sin))
-        xk_out = self.add(self.mul(xk, freqs_cos),
-                          self.mul(self.rotate_half(xk, swap_mask), freqs_sin))
+        if self.use_rope_slice:
+            xq_out = self.add(self.mul(xq, freqs_cos),
+                              self.mul(self.slice_half(xq), freqs_sin))
+            xk_out = self.add(self.mul(xk, freqs_cos),
+                              self.mul(self.slice_half(xk), freqs_sin))
+        else:
+            xq_out = self.add(self.mul(xq, freqs_cos),
+                              self.mul(self.rotate_half(xq, swap_mask), freqs_sin))
+            xk_out = self.add(self.mul(xk, freqs_cos),
+                              self.mul(self.rotate_half(xk, swap_mask), freqs_sin))
 
         xq_out = self.cast(xq_out, original_type)
         xk_out = self.cast(xk_out, original_type)
@@ -160,6 +180,9 @@ class LlamaRotaryEmbedding(Cell):
         self.add.shard((strategy_in, strategy_in))
         self.bmm_swap.shard((strategy_in, (1, 1)))
         self.mul.shard((strategy_in, (strategy_in[0], 1, 1, 1)))
+        self.neg.shard((strategy_in,))
+        self.slice.shard((strategy_in,))
+        self.concat.shard((strategy_in, strategy_in))
 
 
 class LlamaEmbedding(Cell):
@@ -232,6 +255,7 @@ class LlamaRMSNorm(nn.Cell):
         Outputs:
             Tensor of shape :math:`(batch, seq_length, hidden_size)`.
     """
+
     def __init__(self, dim, eps=1e-6, compute_type=mstype.float32):
         super(LlamaRMSNorm, self).__init__()
         self.eps = eps
@@ -321,7 +345,7 @@ class LlamaFeedForward(Cell):
             hidden_dim = int((ffn_dim_multiplier + 0.01) * hidden_dim)
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * \
-            ((hidden_dim + multiple_of - 1) // multiple_of)
+                     ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.dtype = compute_dtype
         self.hidden_act = hidden_act
@@ -354,10 +378,10 @@ class LlamaFeedForward(Cell):
         _check_input_dtype(F.dtype(x), "x", [mstype.float32, mstype.float16], self.cls_name)
         x = self.cast(x, self.dtype)
         # [bs, seq, hidden_dim] or [bs * seq, hidden_dim]
-        gate = self.w1(x) # dp,1 -> dp, mp
-        hidden = self.w3(x) # dp,1 -> dp, mp
-        hidden = self.mul(hidden, gate) # dp,mp -> dp, mp
-        output = self.w2(hidden) # dp,mp -> dp, 1
+        gate = self.w1(x)  # dp,1 -> dp, mp
+        hidden = self.w3(x)  # dp,1 -> dp, mp
+        hidden = self.mul(hidden, gate)  # dp,mp -> dp, mp
+        output = self.w2(hidden)  # dp,mp -> dp, 1
         return output
 
     def shard(self, parallel_config):

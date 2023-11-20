@@ -75,11 +75,9 @@ class GeneratorMixin:
             input_ids = input_ids.asnumpy()
         inputs_tmp = []
         for i, index_value in enumerate(current_index):
-            current_index_tmp = (
-                int(index_value) - i * input_ids.shape[1]
-            )  # multibatch
+            current_index_tmp = (int(index_value) - i * input_ids.shape[1])  # multibatch
             # use numpy to slice array to avoid complie ascend slice op
-            inputs_tmp.append(input_ids[i][current_index_tmp : current_index_tmp + 1])
+            inputs_tmp.append(input_ids[i][current_index_tmp: current_index_tmp + 1])
         inputs_tmp = np.array(inputs_tmp, dtype=np.int32)
         model_inputs["input_ids"] = Tensor(inputs_tmp, mstype.int32)
 
@@ -341,7 +339,7 @@ class GeneratorMixin:
             else:
                 model_kwargs["current_index"] = current_index
                 # model prepare input dict
-                model_inputs = self.prepare_inputs_for_generation( # pylint: disable=E1111
+                model_inputs = self.prepare_inputs_for_generation(  # pylint: disable=E1111
                     input_ids, **model_kwargs
                 )
                 # incremental generate
@@ -416,7 +414,7 @@ class GeneratorMixin:
 
                 # Stop judgment
                 if p_args[i][target_index] == generation_config.eos_token_id \
-                    or valid_length_each_example[i] == generation_config.max_length:
+                        or valid_length_each_example[i] == generation_config.max_length:
                     is_finished[i] = True
                     continue
             if streamer is not None:
@@ -535,7 +533,7 @@ class GeneratorMixin:
             input_ids = np.array(input_ids)
         except ValueError as e:
             raise ValueError(str(e) + " Please check your inputs of model.generate(),"
-                             " and make sure the inputs are padded to same length.")
+                                      " and make sure the inputs are padded to same length.")
         input_ids = np.reshape(input_ids, (-1, np.shape(input_ids)[-1]))
         seed = 0 if seed is None else seed
         np.random.seed(seed)
