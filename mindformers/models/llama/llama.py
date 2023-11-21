@@ -21,7 +21,7 @@ try:
     from mindspore._checkparam import Validator
 except ImportError:
     import mindspore._checkparam as Validator
-from mindspore import Tensor, nn
+from mindspore import Tensor, nn, ops
 from mindspore.context import ParallelMode
 from mindspore.ops import operations as P
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
@@ -187,7 +187,8 @@ class LlamaModel(BaseModel):
             pretrain_seqlen=config.pretrain_seqlen, extend_method=config.extend_method)
         # pylint: disable=C0330
         self.get_attention_mask = CausalMask(seq_length, is_dynamic=self.is_dynamic,
-            parallel_config=config.parallel_config.dp_mp_config).to_float(config.compute_dtype)
+                                             parallel_config=config.parallel_config.dp_mp_config).to_float(
+            config.compute_dtype)
 
         self.multiply_data = Tensor([-10000.0], dtype=config.compute_dtype)
         self.one = Tensor([1.0], dtype=config.compute_dtype)
@@ -264,7 +265,8 @@ class LlamaModel(BaseModel):
             self.le_past = P.LessEqual()
 
     # pylint: disable=W0613
-    def construct(self, tokens: Tensor, input_position=None, batch_valid_length=None, batch_index=None):
+    def construct(self, tokens: Tensor, input_position=None, batch_valid_length=None, batch_index=None,
+                  zactivate_len=None):
         """
         Forward of llama model.
 
@@ -304,15 +306,17 @@ class LlamaModel(BaseModel):
                          self.swap_mask)
             # mask: [bs, seq, seq]
         else:
+            seq_range = self.slice(self.range, (0, 0, 0), (1, 1, ops.shape(zactivate_len)[0]), (1, 1, 1))
             cur_pos = batch_valid_length - 1  # bs
             valid_length = self.reshape(cur_pos, (-1, 1, 1))  # bs, 1, 1
-            valid_length_vector = self.cast((self.equal_past(seq_range, valid_length)), self.dtype)  # bs, 1, maxseq
+            valid_length_vector = self.cast((self.equal_past(seq_range, valid_length)),
+                                            self.dtype)  # bs, 1, activate_len
             freqs_cis = (self.reshape(self.gather_past(self.freqs_cos, cur_pos, 0), (bs, 1, seq_len, self.head_dim)),
                          self.reshape(self.gather_past(self.freqs_sin, cur_pos, 0), (bs, 1, seq_len, self.head_dim)),
                          self.swap_mask)
 
-            mask_range = self.reshape(seq_range, (1, 1, -1))  # 1, 1, maxseq
-            mask = self.le_past(mask_range, valid_length)  # bs, 1, maxseq
+            mask_range = self.reshape(seq_range, (1, 1, -1))  # 1, 1, activate_len
+            mask = self.le_past(mask_range, valid_length)  # bs, 1, activate_len
             # mask: [bs, 1, seq]
         mask = self.sub(self.one, self.cast(mask, self.dtype))
         valid_length_vector = self.expand_dims(valid_length_vector, 3)
@@ -327,7 +331,8 @@ class LlamaModel(BaseModel):
         h = self.reshape(h, (bs, seq_len, self.hidden_size))
         for i in range(self.num_layers):
             if self.use_kvcache_mgr:
-                h = self.layers[i](h, freqs_cis, mask, valid_length_vector=cur_pos, batch_index=batch_index)
+                h = self.layers[i](h, freqs_cis, mask, valid_length_vector=cur_pos, batch_index=batch_index,
+                                   zactivate_len=zactivate_len)
             else:
                 h = self.layers[i](h, freqs_cis, mask, valid_length_vector=valid_length_vector)
         output = self.norm_out(h)
@@ -436,7 +441,7 @@ class LlamaForCausalLM(BaseModel):
 
     # pylint: disable=W0613
     def construct(self, input_ids, labels=None, input_position=None, position_ids=None, attention_mask=None,
-                  input_embeds=None, init_reset=True, batch_valid_length=None, batch_index=None):
+                  input_embeds=None, init_reset=True, batch_valid_length=None, batch_index=None, zactivate_len=None):
         r"""
         LlamaForCausalLM forward.
 
@@ -464,7 +469,7 @@ class LlamaForCausalLM(BaseModel):
         else:
             tokens = input_ids
 
-        output = self.model(tokens, input_position, batch_valid_length, batch_index)
+        output = self.model(tokens, input_position, batch_valid_length, batch_index, zactivate_len)
         logits = self.lm_head(output)
 
         if self.phase == 'predict':
