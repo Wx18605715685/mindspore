@@ -254,7 +254,7 @@ class LLamaAttention(nn.Cell):
                 self.mul_past.shard(((dp, mp, 1, 1), (dp, 1, 1, 1)))
 
     def construct(self, x: Tensor, freqs_cis: Tuple[Tensor, Tensor], mask=None,
-                  key_past=None, value_past=None, valid_length_vector=None, batch_index=None):
+                  key_past=None, value_past=None, valid_length_vector=None, batch_index=None, zactivate_len=None):
         """Forward process of the MultiHeadAttention"""
         ori_dtype = x.dtype
         bs, seq_len, _ = self.shape(x)
@@ -304,10 +304,11 @@ class LLamaAttention(nn.Cell):
                                      self.seq_length_tensor_pad, self.seq_length_tensor_pad)
                 self.decoder_kvcache(value_past, value, valid_length, batch_index_pad, self.seq_lengt_axis_tensor_pad,
                                      self.seq_length_tensor_pad, self.seq_length_tensor_pad)
-                key_present = self.slice(key_past, (0, 0, 0, 0), (bs, self.n_kv_head, self.seq_length, self.head_dim),
+                act_len = ops.shape(zactivate_len)[0]
+                key_present = self.slice(key_past, (0, 0, 0, 0), (bs, self.n_kv_head, act_len, self.head_dim),
                                          (1, 1, 1, 1))
-                value_present = self.slice(value_past, (0, 0, 0, 0),
-                                           (bs, self.n_kv_head, self.seq_length, self.head_dim), (1, 1, 1, 1))
+                value_present = self.slice(value_past, (0, 0, 0, 0), (bs, self.n_kv_head, act_len, self.head_dim),
+                                           (1, 1, 1, 1))
         elif self.use_past:
             # The first graph with the input size of (bs, seq_length)
             if self.is_first_iteration:
@@ -572,7 +573,7 @@ class LLamaDecodeLayer(nn.Cell):
                 self.mul_past.shard(((dp, mp, 1, 1), (1,)))
                 self.assign_past.shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
 
-    def construct(self, x, freqs_cis, mask=None, valid_length_vector=None, batch_index=None):
+    def construct(self, x, freqs_cis, mask=None, valid_length_vector=None, batch_index=None, zactivate_len=None):
         """ Forward of transformer block. """
         self._check_input(x, freqs_cis, mask)
         # [bs, seq/1, hidden_dim]
@@ -580,7 +581,7 @@ class LLamaDecodeLayer(nn.Cell):
 
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
         h = self.attention(input_x, freqs_cis, mask,
-                           self.key_past, self.value_past, valid_length_vector, batch_index)
+                           self.key_past, self.value_past, valid_length_vector, batch_index, zactivate_len)
         h = self.add(x, h)
         ffn_norm = self.ffn_norm(h)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
