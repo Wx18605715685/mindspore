@@ -30,6 +30,7 @@ from mindformers.tools.register import MindFormerConfig
 # pylint: disable=W0611
 from research.baichuan2.baichuan2_7b import Baichuan7BV2ForCausalLM
 from research.baichuan2.baichuan2_13b import Baichuan13BV2ForCausalLM
+from research.internlm.internlm_dyn_kvcache import InternLMForCausalLM
 
 # pylint: disable=W0611
 import research.qwen.qwen_model
@@ -144,6 +145,45 @@ def get_baichuan2_inc_model_input(batch_size, seq_length, prefill):
     return input_ids, None, input_position, None, None, None, init_reset, batch_valid_length
 
 
+def get_internlm_dyn_inc_model_input(batch_size, seq_length, prefill):
+    """get internlm kv cache model input tuple."""
+    if not prefill:
+        seq_length = 1
+    init_reset = not prefill
+    input_ids = dummy_tensor(shape=[batch_size, seq_length], dtype=ms.int32)
+    input_position = dummy_tensor(shape=[batch_size], dtype=ms.int32)
+    init_reset = ms.Tensor([init_reset], mstype.bool_)
+    batch_valid_length = dummy_tensor(shape=[batch_size], dtype=ms.int64)
+    batch_index = dummy_tensor(shape=[batch_size], dtype=ms.int64)
+    print(f'input_ids shape: {input_ids.shape}', flush=True)
+    print(f'input_position shape: {input_position.shape}', flush=True)
+    print(f'batch_valid_length shape: {batch_valid_length.shape}', flush=True)
+    return input_ids, None, input_position, None, None, None, None, batch_valid_length, batch_index, None
+
+
+def dummy_tensor(shape, dtype):
+    if None in shape:
+        return ms.Tensor(shape=shape, dtype=dtype)
+    return ms.Tensor(np.ones(shape=tuple(shape)), dtype=dtype)
+
+
+def load_qkv_ckpt(model):
+    """Load qkv concat checkpoint."""
+    param_dict = model.parameters_dict()
+    for name, param in model.parameters_and_names():
+        print(f"name == {name}")
+        if "wqkv" in name:
+            print(f"before load param = {param.value()[0,:50]}")
+            print(f"before qkv shape = {param.shape}")
+            query = param_dict[name.replace("wqkv", "wq")]
+            key = param_dict[name.replace("wqkv", "wk")]
+            value = param_dict[name.replace("wqkv", "wv")]
+            qkv = ms.ops.cat((query, key, value), 0)
+            print(f"qkv shape = ", qkv.shape)
+            param.set_data(qkv, param.dtype)
+            print(f"end load param = {param.value()[0,:50]}")
+
+
 PREFILL_MODEL_INPUT_MAP = {
     "bloom": get_llm_common_prefill_model_input,
     "llama": get_llm_common_prefill_model_input,
@@ -152,6 +192,7 @@ PREFILL_MODEL_INPUT_MAP = {
     "gpt2": get_gpt2_model_input,
     "glm2": get_glm2_prefill_model_input,
     "baichuan2": get_llm_common_prefill_model_input,
+    "internlm": get_llm_common_prefill_model_input,
     "qwen": get_llm_common_prefill_model_input
 }
 
@@ -164,6 +205,7 @@ INCREMENT_MODEL_INPUT_MAP = {
     "glm2": get_glm2_inc_model_input,
     "codegeex2": get_glm2_inc_model_input,
     "baichuan2": get_baichuan2_inc_model_input,
+    "internlm": get_internlm_dyn_inc_model_input,
     "qwen": get_llama_inc_model_input
 }
 
@@ -198,7 +240,7 @@ def export_single_model(config, batch_size, model_type: str = 'MINDIR', model_di
               file_format=model_type.upper())
 
 
-def export_inc_model(config, batch_size, model_type: str = 'MINDIR', model_dir=None):
+def export_inc_model(config, batch_size, model_type: str = 'MINDIR', qkv_concat=False, model_dir=None):
     """
         export kvcache model.
         Args:
@@ -213,6 +255,8 @@ def export_inc_model(config, batch_size, model_type: str = 'MINDIR', model_dir=N
         model = build_model(config.model)
         if config.model.model_config.pet_config:
             model = get_pet_model(model, config.model.model_config.pet_config)
+    if qkv_concat:
+        load_qkv_ckpt(model)
     model.set_train(False)
     model_prefix = model_name.split('_')[0]
     if model_prefix in INCREMENT_MODEL_INPUT_MAP.keys():
@@ -263,7 +307,7 @@ def main(args_):
     if not config.infer.increment_model_path:
         export_single_model(config, args_.batch_size, args_.model_type, model_dir)
     else:
-        export_inc_model(config, args_.batch_size, args_.model_type, model_dir)
+        export_inc_model(config, args_.batch_size, args_.model_type, args_.qkv_concat, model_dir)
 
 
 if __name__ == "__main__":
@@ -284,6 +328,10 @@ if __name__ == "__main__":
         '--model_type', default="MINDIR",
         type=str,
         help='model type of exported model.')
+    parser.add_argument(
+        '--qkv_concat', default=False,
+        type=str,
+        help='concat qkv linear or not.')
     parser.add_argument(
         '--device_id', default=0,
         type=int,
