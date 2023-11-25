@@ -38,10 +38,12 @@ class KVCacheMgrOp(nn.Cell):
                  compute_dtype=mstype.float16,
                  use_past=False,
                  parallel_config=default_dpmp_config,
-                 max_cache_length=1024*32):
+                 max_cache_length=1024*32,
+                 act_len=False):
         super(KVCacheMgrOp, self).__init__(auto_prefix=False)
         self.shape = P.Shape()
         self.max_cache_length = max_cache_length
+        self.act_len = act_len
         self.sub = P.Sub()
         self.div = P.Div()
         self.pad = P.PadV3()
@@ -129,16 +131,20 @@ class KVCacheMgrOp(nn.Cell):
                 self.decoder_kvcache(self.value_past, value, batch_valid_length.astype(mstype.int64),
                                      self.kvcache_pad8_tensor, self.seq_length_axis_tensor_pad,
                                      seq_length_tensor_pad, seq_length_tensor_pad)
-                # slice
-                key_present = self.slice(self.key_past, (0, 0, 0, 0),
-                                         (batch_size, self.n_head, ops.shape(zactivate_len)[0], self.size_per_head),
-                                         (1, 1, 1, 1))
-                value_present = self.slice(self.value_past, (0, 0, 0, 0),
-                                           (batch_size, self.n_head, ops.shape(zactivate_len)[0], self.size_per_head),
-                                           (1, 1, 1, 1))
-                # key, value = self.key_past, self.value_past
-                key, value = key_present, value_present
-                # key = F.reshape(key, (batch_size, self.n_head, -1, self.size_per_head))
-                # value = F.reshape(value, (batch_size, self.n_head, -1, self.size_per_head))
+                if self.act_len:
+                    # kv slice
+                    key_past = F.reshape(self.key_past, (batch_size, self.n_head, -1, self.size_per_head))
+                    value_past = F.reshape(self.value_past, (batch_size, self.n_head, -1, self.size_per_head))
+                    key_present = self.slice(key_past, (0, 0, 0, 0), (batch_size, self.n_head,
+                                                                      ops.shape(zactivate_len)[0],
+                                                                      self.size_per_head), (1, 1, 1, 1))
+                    value_present = self.slice(value_past, (0, 0, 0, 0), (batch_size, self.n_head,
+                                                                          ops.shape(zactivate_len)[0],
+                                                                          self.size_per_head), (1, 1, 1, 1))
+                    key, value = key_present, value_present
+                else:
+                    key, value = self.key_past, self.value_past
+                    key = F.reshape(key, (batch_size, self.n_head, -1, self.size_per_head))
+                    value = F.reshape(value, (batch_size, self.n_head, -1, self.size_per_head))
                 key_present, value_present = None, None
         return key, value
