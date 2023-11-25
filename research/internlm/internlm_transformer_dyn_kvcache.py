@@ -118,6 +118,8 @@ class InternLMAttention(nn.Cell):
                  use_past=False,
                  use_flash_attention=False,
                  is_dynamic=False,
+                 qkv_concat=False,
+                 act_len=False,
                  max_cache_length: int = 4096,
                  # compute_in_2d=False,
                  use_past_shard=False,
@@ -140,6 +142,8 @@ class InternLMAttention(nn.Cell):
         # self.compute_in_2d = compute_in_2d
         self.use_flash_attention = use_flash_attention and FLASHATTENTION_VALID
         self.is_dynamic = is_dynamic
+        self.qkv_concat = qkv_concat
+        self.act_len = act_len
         self.use_kvcache_mgr = use_kvcache_mgr
 
         if self.hidden_size % self.n_head != 0:
@@ -189,11 +193,12 @@ class InternLMAttention(nn.Cell):
                          has_bias=bias,
                          compute_dtype=compute_dtype,
                          param_init_type=param_init_type)
-        self.wqkv = Linear(self.hidden_size,
-                           self.hidden_size + self.n_kv_head * self.head_dim + self.n_kv_head * self.head_dim,
-                           has_bias=bias,
-                           compute_dtype=compute_dtype,
-                           param_init_type=param_init_type)
+        if self.qkv_concat:
+            self.wqkv = Linear(self.hidden_size,
+                               self.hidden_size + self.n_kv_head * self.head_dim + self.n_kv_head * self.head_dim,
+                               has_bias=bias,
+                               compute_dtype=compute_dtype,
+                               param_init_type=param_init_type)
 
         dp = parallel_config.data_parallel
         mp = parallel_config.model_parallel
@@ -214,7 +219,8 @@ class InternLMAttention(nn.Cell):
             self.wk.shard(((dp, 1), (mp, 1)))
             self.wv.shard(((dp, 1), (mp, 1)))
             self.wo.shard(((dp, mp), (1, mp)))
-            self.wqkv.shard(((dp, 1), (mp, 1)))
+            if self.qkv_concat:
+                self.wqkv.shard(((dp, 1), (mp, 1)))
 
             if parallel_config.use_seq_parallel and self.is_first_iteration:
                 self.wo.shard(((dp, mp), (1, mp)), out_strategy_matmul=((dp * mp, 1),))
@@ -238,7 +244,8 @@ class InternLMAttention(nn.Cell):
                                             compute_dtype=self.dtype,
                                             use_past=self.use_past,
                                             parallel_config=parallel_config,
-                                            max_cache_length=self.max_cache_length)
+                                            max_cache_length=self.max_cache_length,
+                                            act_len=self.act_len)
 
         if self.use_past:
             # operators used for state reuse
@@ -265,15 +272,16 @@ class InternLMAttention(nn.Cell):
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
         bs, seq_len, _ = self.shape(x)
 
-        # [bs * seq/1, hidden_dim]
-        # query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
-        # key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
-        # value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
-
-        # qkv_concat
-        qkv = self.cast(self.wqkv(x), self.dtype)
-        query, key, value = ops.split(qkv, (self.hidden_size,
-                                            self.n_kv_head * self.head_dim, self.n_kv_head * self.head_dim), axis=2)
+        if not self.qkv_concat:
+            # [bs * seq/1, hidden_dim]
+            query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
+            key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
+            value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
+        else:
+            # qkv_concat
+            qkv = self.cast(self.wqkv(x), self.dtype)
+            query, key, value = ops.split(qkv, (self.hidden_size,
+                                                self.n_kv_head * self.head_dim, self.n_kv_head * self.head_dim), axis=2)
 
         if self.use_past and not self.is_first_iteration:
             query = self.reshape(query, (bs, self.n_head, 1, self.head_dim))
@@ -474,6 +482,8 @@ class InternLMDecodeLayer(nn.Cell):
                  use_past=False,
                  use_flash_attention=False,
                  is_dynamic=False,
+                 qkv_concat=False,
+                 act_len=False,
                  max_cache_length: int = 4096,
                  # compute_in_2d=False,
                  use_past_shard=False,
@@ -519,6 +529,8 @@ class InternLMDecodeLayer(nn.Cell):
                                            use_past=use_past,
                                            use_flash_attention=use_flash_attention,
                                            is_dynamic=is_dynamic,
+                                           qkv_concat=qkv_concat,
+                                           act_len=act_len,
                                            max_cache_length=max_cache_length,
                                            # compute_in_2d=compute_in_2d,
                                            use_past_shard=use_past_shard,

@@ -124,6 +124,8 @@ class InternLMModel(BaseModel):
         self.is_first_iteration = True
         self.use_past = config.use_past
         self.is_dynamic = config.is_dynamic
+        self.qkv_concat = config.qkv_concat
+        self.act_len = config.act_len
         self.max_cache_length = config.max_cache_length
         self.use_kvcache_mgr = config.use_kvcache_mgr
         self.use_flash_attention = config.use_flash_attention and FLASHATTENTION_VALID
@@ -175,6 +177,8 @@ class InternLMModel(BaseModel):
                                         use_past=config.use_past,
                                         use_flash_attention=config.use_flash_attention,
                                         is_dynamic=self.is_dynamic,
+                                        qkv_concat=self.qkv_concat,
+                                        act_len=self.act_len,
                                         max_cache_length=self.max_cache_length,
                                         # compute_in_2d=config.compute_in_2d,
                                         use_past_shard=config.use_past_shard,
@@ -225,10 +229,14 @@ class InternLMModel(BaseModel):
         # preprocess
         bs, seq_len = self.shape(tokens)
         if self.is_dynamic:
-            if self.is_first_iteration:
+            if not self.act_len:
                 seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, self.max_cache_length // bs), (1, 1, 1))
             else:
-                seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, ops.shape(zactivate_len)[0]), (1, 1, 1))
+                if self.is_first_iteration:
+                    seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, self.max_cache_length // bs), (1, 1, 1))
+                else:
+                    seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, ops.shape(zactivate_len)[0]), (1, 1, 1))
+
         else:
             seq_range = self.range
 
@@ -392,7 +400,7 @@ class InternLMForCausalLM(BaseModel):
 
     # pylint: disable=W0613
     def construct(self, input_ids, labels=None, input_position=None, position_ids=None, attention_mask=None,
-                  input_embeds=None, init_reset=True, batch_valid_length=None, batch_index=None):
+                  input_embeds=None, init_reset=True, batch_valid_length=None, batch_index=None, zactivate_len=None):
         """InternLMForCausalLM forward."""
         bs, seq_len = self.shape(input_ids)
         if self.use_past:
@@ -403,7 +411,7 @@ class InternLMForCausalLM(BaseModel):
         else:
             tokens = input_ids
 
-        output = self.model(tokens, input_position, batch_valid_length, batch_index)
+        output = self.model(tokens, input_position, batch_valid_length, batch_index, zactivate_len)
         logits = self.lm_head(output)
 
         if self.phase == 'predict':

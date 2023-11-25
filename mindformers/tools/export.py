@@ -145,7 +145,7 @@ def get_baichuan2_inc_model_input(batch_size, seq_length, prefill):
     return input_ids, None, input_position, None, None, None, init_reset, batch_valid_length
 
 
-def get_internlm_dyn_inc_model_input(batch_size, seq_length, prefill):
+def get_internlm_dyn_inc_model_input(batch_size, seq_length, act_len, prefill):
     """get internlm kv cache model input tuple."""
     if not prefill:
         seq_length = 1
@@ -158,7 +158,12 @@ def get_internlm_dyn_inc_model_input(batch_size, seq_length, prefill):
     print(f'input_ids shape: {input_ids.shape}', flush=True)
     print(f'input_position shape: {input_position.shape}', flush=True)
     print(f'batch_valid_length shape: {batch_valid_length.shape}', flush=True)
-    return input_ids, None, input_position, None, None, None, None, batch_valid_length, batch_index, None
+    if act_len:
+        zactivate_len = dummy_tensor(shape=[None], dtype=ms.int64)
+        print(f'zactivate_len shape: {zactivate_len.shape}', flush=True)
+    else:
+        zactivate_len = None
+    return input_ids, None, input_position, None, None, None, None, batch_valid_length, batch_index, zactivate_len
 
 
 def dummy_tensor(shape, dtype):
@@ -210,7 +215,7 @@ INCREMENT_MODEL_INPUT_MAP = {
 }
 
 
-def export_single_model(config, batch_size, model_type: str = 'MINDIR', model_dir=None):
+def export_single_model(config, batch_size, seq_length, model_type: str = 'MINDIR', model_dir=None):
     """
     export no kvcache model.
     Args:
@@ -228,7 +233,7 @@ def export_single_model(config, batch_size, model_type: str = 'MINDIR', model_di
     model.set_train(False)
     model_prefix = model_name.split('_')[0]
     if model_prefix in PREFILL_MODEL_INPUT_MAP.keys():
-        inputs = PREFILL_MODEL_INPUT_MAP[model_prefix](batch_size, config.infer.infer_seq_length)
+        inputs = PREFILL_MODEL_INPUT_MAP[model_prefix](batch_size, seq_length)
     else:
         raise NotImplementedError(f"model {model_name} not implemented.")
 
@@ -240,7 +245,8 @@ def export_single_model(config, batch_size, model_type: str = 'MINDIR', model_di
               file_format=model_type.upper())
 
 
-def export_inc_model(config, batch_size, model_type: str = 'MINDIR', qkv_concat=False, model_dir=None):
+def export_inc_model(config, batch_size, seq_length, model_type: str = 'MINDIR',
+                     qkv_concat=False, act_len=False, model_dir=None):
     """
         export kvcache model.
         Args:
@@ -267,7 +273,7 @@ def export_inc_model(config, batch_size, model_type: str = 'MINDIR', qkv_concat=
     suffix = model_type.lower()
     # export prefill
     filename = config.infer.prefill_model_path.rstrip("." + suffix)
-    inputs = func(batch_size, config.infer.infer_seq_length, True)
+    inputs = func(batch_size, seq_length, act_len, True)
     model.add_flags_recursive(is_first_iteration=True)
     ms.export(model, *inputs,
               file_name=filename,
@@ -275,7 +281,7 @@ def export_inc_model(config, batch_size, model_type: str = 'MINDIR', qkv_concat=
     print("Prefill model exported.")
     # export inc
     filename = config.infer.increment_model_path.rstrip("." + suffix)
-    inputs = func(batch_size, config.infer.infer_seq_length, False)
+    inputs = func(batch_size, seq_length, act_len, False)
     model.add_flags_recursive(is_first_iteration=False)
     ms.export(model, *inputs,
               file_name=filename,
@@ -304,10 +310,14 @@ def main(args_):
     if not config.infer.prefill_model_path:
         raise ValueError(f"prefill_model_path in {args_.config_path} is empty.")
 
+    batch_size = None if config.model.model_config.is_dynamic else config.model.model_config.batch_size
+    seq_length = None if config.model.model_config.is_dynamic else config.model.model_config.seq_length
+    qkv_concat = config.model.model_config.qkv_concat
+    act_len = config.model.model_config.act_len
     if not config.infer.increment_model_path:
-        export_single_model(config, args_.batch_size, args_.model_type, model_dir)
+        export_single_model(config, batch_size, seq_length, args_.model_type, model_dir)
     else:
-        export_inc_model(config, args_.batch_size, args_.model_type, args_.qkv_concat, model_dir)
+        export_inc_model(config, batch_size, seq_length, args_.model_type, qkv_concat, act_len, model_dir)
 
 
 if __name__ == "__main__":
@@ -328,10 +338,6 @@ if __name__ == "__main__":
         '--model_type', default="MINDIR",
         type=str,
         help='model type of exported model.')
-    parser.add_argument(
-        '--qkv_concat', default=False,
-        type=str,
-        help='concat qkv linear or not.')
     parser.add_argument(
         '--device_id', default=0,
         type=int,
