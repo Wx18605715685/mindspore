@@ -19,6 +19,7 @@ import time
 from typing import Union, List, Optional
 
 import numpy as np
+import mindspore_lite as mslite
 from mindspore_lite import Model
 
 from mindformers.tools.logger import logger
@@ -50,6 +51,12 @@ class BaseInputsOfInfer:
         for input_np, tensor in zip(input_list, lite_inputs):
             tensor.set_data_from_numpy(input_np)
         return lite_inputs
+
+    def get_lite_tensor(self, inputs):
+        input_tensors = []
+        for item in inputs:
+            input_tensors.append(mslite.Tensor(item))
+        return input_tensors
 
 
 class CommonInputsOfInfer(BaseInputsOfInfer):
@@ -152,6 +159,27 @@ class GLMInputsOfInfer(BaseInputsOfInfer):
         return lite_inputs
 
 
+class Baichuan2InputsOfInfer(BaseInputsOfInfer):
+    """
+    common infer inputs of llm models.
+    """
+    # pylint: disable=W0221
+    def get_inputs(self, model: Model, input_ids=None, current_index=None, valid_length=None,
+                   init_reset=None, is_first_iteration=True, **kwargs):
+        if not is_first_iteration:
+            inputs_tmp = []
+            for i in range(len(current_index)):
+                current_index_tmp = int(current_index[i]) - i * input_ids.shape[1]  # multibatch
+                # use numpy to slice array to avoid complie ascend slice op
+                inputs_tmp.append(input_ids[i][current_index_tmp:current_index_tmp + 1])
+            input_ids = np.array(inputs_tmp, dtype=np.int32)
+        batch_size = input_ids.shape[0]
+        batch_index = np.arange(batch_size, dtype=np.int32)
+        inputs = [input_ids, current_index, init_reset, valid_length, batch_index]
+        lite_inputs = self.get_lite_tensor(inputs)
+        return lite_inputs
+
+
 class InputOfInfer:
     """
     Input of llm model.
@@ -163,6 +191,7 @@ class InputOfInfer:
         "gpt2": CommonInputsOfInfer,
         "codegeex2": CommonInputsOfInfer,
         "glm": GLMInputsOfInfer,
+        "baichuan2": Baichuan2InputsOfInfer,
         "common": CommonInputsOfInfer
     }
 
@@ -199,6 +228,7 @@ class TextGeneratorInfer(BaseInfer):
     # pylint: disable=W0221
     def infer(self,
               inputs: Union[str, List[str]],
+              model_name: str = 'common',
               do_sample: bool = False,
               top_k: int = 1,
               top_p: float = 1.0,
@@ -207,7 +237,9 @@ class TextGeneratorInfer(BaseInfer):
               eos_token_id: int = 2,
               pad_token_id: int = 0,
               max_length: int = 256,
+              max_input_length: int = 256,
               is_sample_acceleration: bool = False,
+              is_performance: bool = False,
               add_special_tokens: bool = False,
               streamer: Optional[BaseStreamer] = None,
               **kwargs):
@@ -242,18 +274,25 @@ class TextGeneratorInfer(BaseInfer):
         Returns:
             outputs of model infer
         """
-        input_ids = self.preprocess(inputs, add_special_tokens)
+        input_ids = self.preprocess(inputs, model_name, max_input_length, add_special_tokens)
         output_ids = self.generate(input_ids, do_sample, top_k, top_p, temperature,
                                    repetition_penalty, eos_token_id, pad_token_id,
-                                   max_length, is_sample_acceleration, streamer, **kwargs)
+                                   max_length, is_sample_acceleration, is_performance, streamer, **kwargs)
         outputs = self.postprocess(output_ids)
         return outputs
 
     # pylint: disable=W0613
-    def preprocess(self, input_data, add_special_tokens=False, **kwargs):
+    def preprocess(self, input_data, model_name, max_input_length, add_special_tokens=False, **kwargs):
         """preprocess."""
-        tokens = self.tokenizer(input_data, add_special_tokens=add_special_tokens)
-        input_ids = tokens["input_ids"]
+        if model_name.startswith('baichuan2'):
+            assistant_token_id = 196 # the final prompt of baichuan2
+            tokens = self.tokenizer(input_data, add_special_tokens=add_special_tokens,
+                                    max_length=max_input_length, padding='longest',
+                                    truncation=True)
+            input_ids = [token + [assistant_token_id,] for token in tokens["input_ids"]]
+        else:
+            tokens = self.tokenizer(input_data, add_special_tokens=add_special_tokens)
+            input_ids = tokens["input_ids"]
         input_list = []
         if isinstance(input_data, str):
             input_list.append(input_ids)
@@ -329,7 +368,7 @@ class TextGeneratorInfer(BaseInfer):
         return warpers
 
     def generate(self, input_ids, do_sample, top_k, top_p, temperature, repetition_penalty, eos_token_id,
-                 pad_token_id, max_length, is_sample_acceleration, streamer, **kwargs):
+                 pad_token_id, max_length, is_sample_acceleration, is_performance, streamer, **kwargs):
         """token generator."""
         total_time = time.time()
         sampler_dict = {"do_sample": do_sample, "top_k": top_k, "top_p": top_p, "temperature": temperature,
@@ -433,7 +472,7 @@ class TextGeneratorInfer(BaseInfer):
 
                 # Stop judgment when output is EOS token, with the output
                 # is appended to input_ids and streamer.
-                if target == eos_token_id:
+                if target == eos_token_id and not is_performance:
                     is_finished[i] = True
                     continue
 

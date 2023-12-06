@@ -26,6 +26,7 @@ import mindspore.common.dtype as mstype
 from mindformers import AutoModel
 from mindformers.models import build_model
 from mindformers.pet import get_pet_model
+from mindformers.tools.utils import str2bool
 from mindformers.tools.register import MindFormerConfig
 # pylint: disable=W0611
 from research.baichuan2.baichuan2_7b import Baichuan7BV2ForCausalLM
@@ -132,8 +133,8 @@ def get_glm_inc_model_input(batch_size, seq_length, prefill):
     batch_valid_length = ms.Tensor([128] * batch_size, mstype.int32)
     return input_ids, position_ids, attention_mask, input_position, None, None, init_reset, batch_valid_length
 
-
-def get_baichuan2_inc_model_input(batch_size, seq_length, prefill):
+# pylint: disable=W0612
+def get_baichuan2_inc_model_input(batch_size, seq_length, act_len, prefill):
     """get baichuan2 kv cache model input tuple."""
     if not prefill:
         seq_length = 1
@@ -141,8 +142,10 @@ def get_baichuan2_inc_model_input(batch_size, seq_length, prefill):
     input_ids = ms.Tensor(np.ones((batch_size, seq_length)), mstype.int32)
     input_position = ms.Tensor([127] * batch_size, mstype.int32)
     init_reset = ms.Tensor([init_reset], mstype.bool_)
-    batch_valid_length = ms.Tensor([[128] * batch_size], mstype.int32)
-    return input_ids, None, input_position, None, None, None, init_reset, batch_valid_length
+    batch_valid_length = ms.Tensor([128] * batch_size, mstype.int32)
+    batch_index = ms.Tensor([128] * batch_size, mstype.int32)
+    zactivate_len = act_len
+    return input_ids, None, input_position, None, None, None, init_reset, batch_valid_length, batch_index
 
 
 def get_internlm_dyn_inc_model_input(batch_size, seq_length, act_len, prefill):
@@ -310,8 +313,12 @@ def main(args_):
     if not config.infer.prefill_model_path:
         raise ValueError(f"prefill_model_path in {args_.config_path} is empty.")
 
-    batch_size = None if config.model.model_config.is_dynamic else config.model.model_config.batch_size
-    seq_length = None if config.model.model_config.is_dynamic else config.model.model_config.seq_length
+    if args_.export_dyn:
+        batch_size = None if config.model.model_config.is_dynamic else config.model.model_config.batch_size
+        seq_length = None if config.model.model_config.is_dynamic else config.model.model_config.seq_length
+    else:
+        batch_size = config.model.model_config.batch_size
+        seq_length = config.model.model_config.seq_length
     qkv_concat = config.model.model_config.qkv_concat
     act_len = config.model.model_config.act_len
     if not config.infer.increment_model_path:
@@ -334,6 +341,10 @@ if __name__ == "__main__":
         '--batch_size', default=1,
         type=int,
         help='batch size of model.')
+    parser.add_argument(
+        '--export_dyn', default=True,
+        type=str2bool,
+        help='Whether export dynamically.')
     parser.add_argument(
         '--model_type', default="MINDIR",
         type=str,
