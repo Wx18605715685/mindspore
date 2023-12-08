@@ -151,13 +151,16 @@ def infer_main(args_):
             sys.exit()
         user_input = build_prompt(user_input, args_.model_name.lower(), args_.prompt)
         output = lite_pipeline.infer(user_input,
+                                     model_name=args_.model_name.lower(),
                                      do_sample=args_.do_sample,
                                      top_k=args_.top_k,
                                      top_p=args_.top_p,
                                      repetition_penalty=args_.repetition_penalty,
                                      temperature=args_.temperature,
                                      max_length=args_.max_length,
+                                     max_input_length=args_.max_input_length,
                                      is_sample_acceleration=args_.is_sample_acceleration,
+                                     is_performance=args_.is_performance,
                                      add_special_tokens=args_.add_special_tokens)
         print(output)
 
@@ -252,8 +255,16 @@ if __name__ == "__main__":
         help="The maximum word length that can be generated."
              "Default: 512")
     parser.add_argument(
+        '--max_input_length', default=512, type=int,
+        help="The maximum word length that can be inputted."
+             "Default: 512")
+    parser.add_argument(
         '--is_sample_acceleration', default=False, type=str2bool,
         help="Whether postprocess in graph or not."
+             "Default: False")
+    parser.add_argument(
+        '--is_performance', default=False, type=str2bool,
+        help="Whether use performance infer mode."
              "Default: False")
     parser.add_argument(
         '--add_special_tokens', default=False, type=str2bool,
