@@ -54,3 +54,5 @@ __all__.extend(llama.__all__)
 __all__.extend(pangualpha.__all__)
 __all__.extend(bloom.__all__)
 __all__.extend(base_tokenizer.__all__)
+
+CONFIG_NAME = "config.json"
