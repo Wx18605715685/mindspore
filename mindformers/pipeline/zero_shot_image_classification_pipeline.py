@@ -19,17 +19,15 @@ from typing import Union, Optional
 from mindspore import Model
 from mindspore.ops import operations as P
 
-from mindformers.mindformer_book import MindFormerBook
 from mindformers.tools.image_tools import load_image
-from mindformers.models import BaseModel, BaseImageProcessor, Tokenizer
+from mindformers.models import BaseModel, BaseImageProcessor
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from mindformers.auto_class import AutoProcessor, AutoModel
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 from ..models import BaseTokenizer
 
 
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="zero_shot_image_classification")
-class ZeroShotImageClassificationPipeline(BasePipeline):
+class ZeroShotImageClassificationPipeline(Pipeline):
     """Pipeline For Zero Shot Image Classification
 
     Args:
@@ -64,31 +62,11 @@ class ZeroShotImageClassificationPipeline(BasePipeline):
         {'score': 1.1771376e-05, 'label': 'dog'},
         {'score': 2.1342253e-06, 'label': 'cat'}]]
     """
-    _support_list = MindFormerBook.get_pipeline_support_task_list()['zero_shot_image_classification'].keys()
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  tokenizer: Optional[BaseTokenizer] = None,
                  image_processor: Optional[BaseImageProcessor] = None,
                  **kwargs):
-        if isinstance(model, str):
-            if model in self._support_list:
-                if image_processor is None:
-                    image_processor = AutoProcessor.from_pretrained(model).image_processor
-                if not isinstance(image_processor, BaseImageProcessor):
-                    raise TypeError(f"image_processor should be inherited from"
-                                    f" BaseImageProcessor, but got {type(image_processor)}.")
-                if tokenizer is None:
-                    tokenizer = AutoProcessor.from_pretrained(model).tokenizer
-                if not isinstance(tokenizer, Tokenizer):
-                    raise TypeError(f"tokenizer should be inherited from"
-                                    f" PretrainedTokenizer, but got {type(tokenizer)}.")
-                model = AutoModel.from_pretrained(model)
-            else:
-                raise ValueError(f"{model} is not supported by ZeroShotImageClassificationPipeline,"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if tokenizer is None:
             raise ValueError("ZeroShotImageClassificationPipeline"
@@ -168,7 +146,7 @@ class ZeroShotImageClassificationPipeline(BasePipeline):
         return {"image_processed": image_processed,
                 "input_ids": input_ids, "candidate_labels": candidate_labels}
 
-    def forward(self, model_inputs: dict, **forward_params):
+    def _forward(self, model_inputs: dict, **forward_params):
         """Forward process
 
         Args:

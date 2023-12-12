@@ -14,15 +14,12 @@
 # ============================================================================
 
 """TranslationPipeline"""
-import os.path
 from typing import Union, Optional
 
 import mindspore
 from mindspore import Tensor, Model
 
-from ..auto_class import AutoProcessor, AutoModel
-from ..mindformer_book import MindFormerBook
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 from ..tools.register import MindFormerRegister, MindFormerModuleType
 from ..models import BaseModel, BaseTokenizer
 
@@ -30,7 +27,7 @@ __all__ = ['TranslationPipeline']
 
 
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="translation")
-class TranslationPipeline(BasePipeline):
+class TranslationPipeline(Pipeline):
     """Pipeline for Translation
 
     Args:
@@ -79,26 +76,11 @@ class TranslationPipeline(BasePipeline):
         >>> print(output)
         [{'translation_text': ['un băiat bun!']}]
     """
-    _support_list = MindFormerBook.get_model_support_list()['t5']
     return_name = 'translation'
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  tokenizer: Optional[BaseTokenizer] = None,
                  **kwargs):
-        if isinstance(model, str):
-            if model in self._support_list or os.path.isdir(model):
-                if tokenizer is None:
-                    tokenizer = AutoProcessor.from_pretrained(model).tokenizer
-                model = AutoModel.from_pretrained(model)
-                if not isinstance(tokenizer, BaseTokenizer):
-                    raise TypeError(f"tokenizer should be inherited from"
-                                    f" BaseTokenizer, but got {type(tokenizer)}.")
-            else:
-                raise ValueError(f"{model} is not supported by {self.__class__.__name__},"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if tokenizer is None:
             raise ValueError(f"{self.__class__.__name__}"
@@ -152,8 +134,8 @@ class TranslationPipeline(BasePipeline):
         input_ids = self.tokenizer(inputs, return_tensors=None)["input_ids"]
         return {"input_ids": input_ids}
 
-    def forward(self, model_inputs: dict,
-                **forward_params):
+    def _forward(self, model_inputs: dict,
+                 **forward_params):
         """The Forward Process of Model
 
         Args:
