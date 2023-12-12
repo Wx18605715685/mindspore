@@ -16,17 +16,29 @@
 import mindspore.common.dtype as mstype
 from ..version_control import get_cell_reuse
 
+str_to_ms_type = {
+    "float16": mstype.float16,
+    "float32": mstype.float32
+}
+
+def reverse_dict(d: dict):
+    new_d = {}
+    for k, v in d.items():
+        if v in new_d:
+            raise ValueError(f"Different keys in dict have same values.")
+        new_d[v] = k
+    return new_d
+
+ms_type_to_str = reverse_dict(str_to_ms_type)
 
 def convert_mstype(ms_type: str = "float16"):
     """Convert the string type to MindSpore type."""
     if isinstance(ms_type, mstype.Float):
         return ms_type
-    if ms_type == "float16":
-        return mstype.float16
-    if ms_type == "float32":
-        return mstype.float32
+    if ms_type in str_to_ms_type:
+        return str_to_ms_type[ms_type]
     raise KeyError(f"Supported data type keywords include: "
-                   f"[float16, float32], but get {ms_type}")
+                   f"{list(str_to_ms_type.keys())}, but get {ms_type}")
 
 
 cell_reuse = get_cell_reuse

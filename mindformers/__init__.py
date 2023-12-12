@@ -14,6 +14,9 @@
 # ============================================================================
 
 """mindformers init"""
+
+__version__ = "0.0.1dev"
+
 from mindformers import core, auto_class, dataset, \
     models, modules, wrapper, tools
 from mindformers.pipeline import *
