@@ -295,6 +295,32 @@ def extract_commit_hash(resolved_file: Optional[str], commit_hash: Optional[str]
     commit_hash = search.groups()[0]
     return commit_hash if REGEX_COMMIT_HASH.match(commit_hash) else None
 
+def get_file_from_repo(
+        path_or_repo: Union[str, os.PathLike],
+        filename: str,
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        force_download: bool = False,
+        resume_download: bool = False,
+        proxies: Optional[Dict[str, str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        revision: Optional[str] = None,
+        local_files_only: bool = False,
+        subfolder: str = "",
+        **deprecated_kwargs,
+):
+    """to do"""
+    path_or_repo = path_or_repo
+    filename = filename
+    cache_dir = cache_dir
+    force_download = force_download
+    resume_download = resume_download
+    proxies = proxies
+    token = token
+    revision = revision
+    local_files_only = local_files_only
+    subfolder = subfolder
+    deprecated_kwargs = deprecated_kwargs
+    return "get_file_from_repo"
 
 class PushToHubMixin:
     """to do"""

@@ -27,8 +27,8 @@ from mindformers.dataset import (
     BatchNormalize, BatchCenterCrop, BatchPILize
 )
 from mindformers.mindformer_book import MindFormerBook
-from ..base_processor import BaseImageProcessor
-from ..base_processor import BaseProcessor
+from mindformers.models.base_processor import BaseProcessor
+from mindformers.models.image_processing_utils import BaseImageProcessor
 from ...tools.register import MindFormerRegister, MindFormerModuleType
 
 

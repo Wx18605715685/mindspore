@@ -19,6 +19,8 @@ from ..version_control import get_cell_reuse
 CONFIG_NAME = "config.json"
 WEIGHTS_NAME = "mindspore_model.ckpt"
 WEIGHTS_INDEX_NAME = "mindspore_model.ckpt.index.json"
+FEATURE_EXTRACTOR_NAME = "preprocessor_config.json"
+IMAGE_PROCESSOR_NAME = FEATURE_EXTRACTOR_NAME
 
 str_to_ms_type = {
     "float16": mstype.float16,

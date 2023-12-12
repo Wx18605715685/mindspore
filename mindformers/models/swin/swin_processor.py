@@ -24,7 +24,8 @@ from mindspore.dataset.vision.transforms import CenterCrop, ToTensor, Normalize,
 from mindformers.mindformer_book import MindFormerBook
 from mindformers.dataset import Resize
 from mindformers.dataset.base_dataset import BaseDataset
-from mindformers.models.base_processor import BaseProcessor, BaseImageProcessor
+from mindformers.models.base_processor import BaseProcessor
+from mindformers.models.image_processing_utils import BaseImageProcessor
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
