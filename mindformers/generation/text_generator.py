@@ -36,7 +36,7 @@ from mindformers.generation.streamers import BaseStreamer
 from mindformers.generation.utils import softmax_with_threads, topk
 from mindformers.tools import logger
 
-__all__ = ["GeneratorMixin"]
+__all__ = ["GenerationMixin"]
 
 
 class GenerationMode:
@@ -51,7 +51,7 @@ class GenerationMode:
     BEAM_SEARCH = "beam_search"
 
 
-class GeneratorMixin:
+class GenerationMixin:
     """Generator For the nlp models"""
 
     def __init__(self):

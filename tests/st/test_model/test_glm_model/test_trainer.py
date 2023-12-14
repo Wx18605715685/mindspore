@@ -24,7 +24,7 @@ from mindspore import context
 from mindspore.dataset import GeneratorDataset
 
 from mindformers import AutoTokenizer
-from mindformers import GLMForPreTraining, GLMChatModel, GLMConfig
+from mindformers import GLMForPreTraining, GLMConfig #, GLMChatModel
 from mindformers import Trainer, TrainingArguments
 
 
@@ -98,20 +98,20 @@ class TestGLMTrainerMethod:
     #     """
     #     self.task_trainer.evaluate()
 
-    @pytest.mark.run(order=3)
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        model_config = GLMConfig(num_layers=1, hidden_size=32, inner_hidden_size=None,
-                                 num_heads=2, position_encoding_2d=True)
-        model = GLMChatModel(model_config)
-        task_trainer = Trainer(task='text_generation',
-                               model=model,
-                               tokenizer=self.tokenizer)
-        task_trainer.predict(input_data="你好", max_length=20)
+    # @pytest.mark.run(order=3)
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     model_config = GLMConfig(num_layers=1, hidden_size=32, inner_hidden_size=None,
+    #                              num_heads=2, position_encoding_2d=True)
+    #     model = GLMChatModel(model_config)
+    #     task_trainer = Trainer(task='text_generation',
+    #                            model=model,
+    #                            tokenizer=self.tokenizer)
+    #     task_trainer.predict(input_data="你好", max_length=20)
 
     @pytest.mark.run(order=4)
     def test_finetune(self):

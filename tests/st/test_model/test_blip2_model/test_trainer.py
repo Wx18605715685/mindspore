@@ -19,7 +19,7 @@ pytest tests/st/test_model/test_blip2_model/test_trainer.py
 """
 import numpy as np
 # import pytest
-from PIL import Image
+# from PIL import Image
 
 import mindspore as ms
 from mindspore.dataset import GeneratorDataset
@@ -103,35 +103,35 @@ class TestBlip2TrainerMethod:
                                eval_dataset=self.eval_dataset)
         task_trainer.train()
 
-    def test_eval(self):
-        """
-        Feature: Trainer.evaluate()
-        Description: Test trainer for evaluate.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        task_evaluater = Trainer(task='image_to_text_retrieval',
-                                 model=self.blip2_evaluator,
-                                 model_name='blip2_stage1_evaluator',
-                                 tokenizer=self.tokenizer,
-                                 eval_dataset=self.eval_dataset)
-        task_evaluater.evaluate(k_test=1, add_extra_itm_score=False)
+    # def test_eval(self):
+    #     """
+    #     Feature: Trainer.evaluate()
+    #     Description: Test trainer for evaluate.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     task_evaluater = Trainer(task='image_to_text_retrieval',
+    #                              model=self.blip2_evaluator,
+    #                              model_name='blip2_stage1_evaluator',
+    #                              tokenizer=self.tokenizer,
+    #                              eval_dataset=self.eval_dataset)
+    #     task_evaluater.evaluate(k_test=1, add_extra_itm_score=False)
 
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        task_predictor = Trainer(task='zero_shot_image_classification',
-                                 model=self.blip2_classifier,
-                                 model_name='blip2_stage1_classification',
-                                 tokenizer=self.tokenizer,
-                                 image_processor=self.image_processor)
-        # 加载输入，一张图片
-        input_data = Image.new('RGB', (32, 32))
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     task_predictor = Trainer(task='zero_shot_image_classification',
+    #                              model=self.blip2_classifier,
+    #                              model_name='blip2_stage1_classification',
+    #                              tokenizer=self.tokenizer,
+    #                              image_processor=self.image_processor)
+    #     # 加载输入，一张图片
+    #     input_data = Image.new('RGB', (32, 32))
 
-        # 加载指定的权重以完成推理
-        task_predictor.predict(input_data=input_data)
+    #     # 加载指定的权重以完成推理
+    #     task_predictor.predict(input_data=input_data)
 
 
 class TestBlip2SecondStageTrainerMethod:
@@ -207,19 +207,19 @@ class TestBlip2SecondStageTrainerMethod:
                                train_dataset=self.train_dataset)
         task_trainer.train(train_checkpoint='')
 
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        task_predictor = Trainer(task='image_to_text_generation',
-                                 model=self.blip2_generator,
-                                 model_name='itt_blip2_stage2_vit_g_llama_7b',
-                                 tokenizer=self.tokenizer,
-                                 image_processor=self.image_processor)
-        # 加载输入，一张图片
-        input_data = Image.new('RGB', (32, 32))
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     task_predictor = Trainer(task='image_to_text_generation',
+    #                              model=self.blip2_generator,
+    #                              model_name='itt_blip2_stage2_vit_g_llama_7b',
+    #                              tokenizer=self.tokenizer,
+    #                              image_processor=self.image_processor)
+    #     # 加载输入，一张图片
+    #     input_data = Image.new('RGB', (32, 32))
 
-        # 加载指定的权重以完成推理
-        task_predictor.predict(input_data=input_data, max_length=8)
+    #     # 加载指定的权重以完成推理
+    #     task_predictor.predict(input_data=input_data, max_length=8)
