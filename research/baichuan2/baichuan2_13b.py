@@ -28,8 +28,10 @@ from mindspore.context import ParallelMode
 from mindspore.ops import operations as P
 from mindspore.common.initializer import initializer, HeUniform
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
+
 try:
     from mindspore.nn.layer.flash_attention import FlashAttention
+
     FLASHATTENTION_VALID = True
 except ImportError:
     FLASHATTENTION_VALID = False
@@ -39,10 +41,9 @@ from mindformers.models.base_model import BaseModel
 from mindformers.models.utils import cell_reuse
 from mindformers.modules.transformer.op_parallel_config import _check_config, default_dpmp_config
 from mindformers.modules.transformer import AttentionMask, TransformerOpParallelConfig
-from mindformers.modules.layers import Linear, _check_input_dtype, _check_past_none_input_none, AlibiTensorV2
+from mindformers.modules.layers import Linear, _check_input_dtype, _check_past_none_input_none, build_alibi_tensor_v2
 from mindformers.modules.kv_cache_mgr_baichuan2 import KVCacheMgrOp
 from mindformers.tools.register.register import MindFormerModuleType, MindFormerRegister
-
 from mindformers.models.llama.llama import layer_compute_dtype
 from mindformers.models.llama.llama_config import LlamaConfig
 from mindformers.models.llama.llama_layer import LlamaEmbedding, LlamaFeedForward, LlamaRMSNorm
@@ -149,6 +150,8 @@ class Baichuan13BV2ForCausalLM(BaseModel):
         self.ones = P.Ones()
         self.gather = P.Gather()
         self.argmax = P.Argmax(-1)
+        self.is_sample_acceleration = config.is_sample_acceleration
+        self.p_all_ones = Tensor(np.ones((config.batch_size, 1), np.float32), mstype.float32)
 
         self.model = Baichuan13BV2Model(config=config)
         self.lm_head = NormHead(hidden_size=config.hidden_size,
@@ -216,12 +219,24 @@ class Baichuan13BV2ForCausalLM(BaseModel):
             tokens = input_ids
 
         output = self.model(tokens, input_position, init_reset, batch_valid_length, batch_index)
+        is_prefilling_phase = (not self.use_past or self.is_first_iteration) and input_position is not None
+        if is_prefilling_phase:
+            output = self.gather(self.reshape(output, (-1, output.shape[-1])), input_position, 0)  # axis=0
         logits = self.lm_head(output)
 
-        if self.phase == 'predict':
-            logits = self.reshape(logits, (bs, seq_len, -1))
-            logits = self._in_graph_gather(logits, input_position)
-            # logits = self._in_graph_argmax(logits)
+        if not self.training:
+            if is_prefilling_phase:
+                logits = self.reshape(logits, (bs, -1))
+            else:
+                logits = self.reshape(logits, (bs, seq_len, -1))
+
+            if self.is_sample_acceleration:
+                return self.get_top_token_id(logits, current_index=input_position)
+
+            # if (not self.use_past or self.is_first_iteration) and input_position is not None:
+            #     logits = logits.reshape(-1, logits.shape[-1])
+            #     index = input_position.view(-1, )
+            #     logits = self.gather(logits, index, 0)
             return logits, tokens
 
         input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
@@ -235,19 +250,25 @@ class Baichuan13BV2ForCausalLM(BaseModel):
                 input_mask = self.mul(input_mask, label_mask)
 
         logits = self.cast(logits, mstype.float32)
-        if not self.training:
-            logits = self.reshape(logits, (bs, seq_len, -1))
-            # makes cast effective to avoid allgather issue in Mindspore1.10
-            input_mask = self.add(input_mask, 1)
-            self._in_graph_gather(logits, input_position)
-            return logits, tokens, input_mask
-
         if logits.ndim > 2:
             logits = self.reshape(logits, (-1, logits.shape[-1]))
         labels = self.reshape(labels, (-1,))
         input_mask = self.reshape(input_mask, (-1,))
         loss = self.loss(logits, labels, input_mask)
         return loss
+
+    def get_top_token_id(self, logits, current_index=None):
+        """get_top_token_id"""
+        # logits = logits.reshape(-1, logits.shape[-1])
+        # if self.use_past and not self.is_first_iteration:
+        #     logits = logits
+        # elif current_index is not None:
+        #     index = current_index.view(-1, )
+        #     logits = P.Gather()(logits, index, 0)
+        # probabilities = P.Softmax(-1)(logits)
+        top_token_id = P.Argmax(-1)(logits)
+        top_token_id = top_token_id.view(-1, 1)
+        return self.p_all_ones, top_token_id
 
 
 class Baichuan13BV2Model(BaseModel):
@@ -299,7 +320,7 @@ class Baichuan13BV2Model(BaseModel):
         self.cast = P.Cast()
         self.mul_mask = P.Mul()
         self.mul_alibi = P.Mul()
-        # self.mul_alibi1 = P.Mul()
+        self.mul_alibi1 = P.Mul()
         self.sub = P.Sub()
         self.expand_dims = P.ExpandDims()
         self.not_equal = P.NotEqual()
@@ -307,6 +328,7 @@ class Baichuan13BV2Model(BaseModel):
         self.transpose = P.Transpose()
         self.slice = P.StridedSlice()
         self.shape = P.Shape()
+        self.add_alibi = P.Add()
 
         self.tok_embeddings = LlamaEmbedding(
             config.vocab_size, config.hidden_size, param_init_type=config.param_init_type)
@@ -340,13 +362,10 @@ class Baichuan13BV2Model(BaseModel):
         self.norm_out = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps,
                                      compute_type=config.layernorm_compute_type)
 
-        self.build_alibi_tensor = AlibiTensorV2(seq_length=config.seq_length,
-                                                num_heads=config.num_heads)
-        # self.alibi_tensor = build_alibi_tensor_v2(seq_length=config.seq_length,
-        #                                           num_heads=config.num_heads,
-        #                                           return_tensors='ms',
-        #                                           dtype=self.dtype)
-
+        self.alibi_tensor = build_alibi_tensor_v2(seq_len=config.seq_length,
+                                                  num_heads=config.num_heads,
+                                                  return_tensors='ms',
+                                                  dtype=self.dtype)
         dp = config.parallel_config.data_parallel
         mp = config.parallel_config.model_parallel
         if not (_get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation()):
@@ -360,15 +379,14 @@ class Baichuan13BV2Model(BaseModel):
                 self.norm_out.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
 
             self.tok_embeddings.shard(config.parallel_config)
-            self.build_alibi_tensor.shard(config.parallel_config)
-
             self.sub.shard(((1,), (dp, 1, 1)))
             self.mul_mask.shard(((dp, 1, 1, 1), (1,)))
-            self.mul_alibi.shard(((dp, mp, 1, 1), (dp, 1, 1, 1))) # (dp, mp, 1, 1)
-            # self.mul_alibi1.shard(((1, mp, 1, 1), (dp, 1, 1, 1)))
+            self.mul_alibi.shard(((dp, mp, 1, 1), (dp, 1, 1, 1)))  # (dp, mp, 1, 1)
+            self.mul_alibi1.shard(((1, mp, 1, 1), (dp, 1, 1, 1)))
             self.expand_dims.shard(((dp, 1, 1),))
             self.not_equal.shard(((dp, 1), ()))
             self.gather.shard(((dp, mp, 1, 1), (1,)))
+            self.add_alibi.shard(((dp, 1, 1, 1), (dp, mp, 1, 1)))
             self.transpose.shard(((1, mp, dp, 1),))
             self.norm_out.shard((dp, 1, 1))
 
@@ -395,33 +413,35 @@ class Baichuan13BV2Model(BaseModel):
                 batch_valid_length = self.ones((bs,), mstype.int32)
 
         if self.is_dynamic:
-            seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, self.max_cache_length // bs), (1, 1, 1))
+            dyn_seq = self.max_cache_length // bs
+            seq_range = self.slice(self.range, (0, 0, 0), (bs, 1, dyn_seq), (1, 1, 1))
         else:
             seq_range = self.range
 
         if self.is_first_iteration:
             cur_pos = batch_valid_length
-            input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
+            input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float16)
             mask = self.get_attention_mask(input_mask)
-            alibi_tensor = self.build_alibi_tensor(input_mask, mstype.float32)
-            # alibi_tensor = self.mul_alibi1(self.alibi_tensor, self.reshape(input_mask, (bs, 1, -1, 1)))
-            # alibi_tensor = self.mul_alibi(alibi_tensor, self.reshape(input_mask, (bs, 1, 1, -1)))
+            alibi_tensor = self.mul_alibi1(self.alibi_tensor, self.reshape(input_mask, (bs, 1, -1, 1)))
+            alibi_tensor = self.mul_alibi(alibi_tensor, self.reshape(input_mask, (bs, 1, 1, -1)))
             # mask: [bs, seq, seq]
+            if self.is_dynamic:
+                mask = self.slice(mask, (0, 0, 0), (bs, seq_len, seq_len), (1, 1, 1))
         else:
             cur_pos = batch_valid_length - 1
             valid_length = self.reshape(cur_pos, (-1, 1, 1))
-            # mask = self.cast(self.le_past(self.range, valid_length), mstype.float32)
             mask_range = self.reshape(seq_range, (1, 1, -1))
             mask = self.le_past(mask_range, valid_length)
-            alibi_tensor = self.build_alibi_tensor(self.all_ones_attention_mask_alibi, mstype.float32)
-            # alibi_tensor = self.gather(alibi_tensor, cur_pos[0], 2)
-            alibi_tensor = self.gather(alibi_tensor, cur_pos, 2)
+            alibi_tensor = self.gather(self.alibi_tensor, cur_pos, 2)
             alibi_tensor = self.transpose(alibi_tensor, (2, 1, 0, 3))
+            alibi_tensor = self.mul_alibi1(alibi_tensor, self.expand_dims(mask, 1))
             # mask: [bs, 1, 1]
-        mask = self.sub(self.one, self.cast(mask, mstype.float32))
+        # mask = self.sub(self.one, self.cast(mask, mstype.float32))
+        mask = self.sub(self.one, mask)
         if not self.use_flash_attention:
             mask = self.expand_dims(mask, 1)
             mask = self.mul_mask(mask, self.multiply_data)
+            mask = self.add_alibi(mask, alibi_tensor)
 
         # tokens: [bs, seq/1]
         h = self.tok_embeddings(tokens)
@@ -498,6 +518,7 @@ class Baichuan13BDecodeLayer(nn.Cell):
               (batch_size, num_heads, seq_length, head_dim)).
 
     """
+
     def __init__(self,
                  batch_size,
                  seq_length,
@@ -536,7 +557,6 @@ class Baichuan13BDecodeLayer(nn.Cell):
         self.dtype = compute_dtype
         self.is_first_iteration = True
         self.use_past = use_past
-        # self.compute_in_2d = compute_in_2d
         self.is_dynamic = is_dynamic
         self.key_past = None
         self.value_past = None
@@ -609,10 +629,6 @@ class Baichuan13BDecodeLayer(nn.Cell):
             if not isinstance(batch_valid_length, Tensor):
                 batch_valid_length = self.ones((bs,), mstype.int32)
         self._check_input(x, alibi_tensor, mask, init_reset, batch_valid_length)
-        # [bs, seq/1, hidden_dim] (first) [bs * seq/1, hidden_dim] (others)
-        # if self.compute_in_2d and x.ndim != 2:
-        #     x = self.reshape(x, (-1, x.shape[-1]))
-        # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
         input_x = self.attention_norm(x)
 
         key_reset = None
@@ -675,7 +691,7 @@ class Baichuan13BDecodeLayer(nn.Cell):
         _check_past_none_input_none(self.use_past, "batch_valid_length", self.cls_name, None,
                                     batch_valid_length_is_tensor, batch_is_default)
 
-        if self.use_past:
+        if self.use_past and not self.is_dynamic:
             _check_input_dtype(init_reset.dtype, "init_reset", [mstype.bool_], self.cls_name)
             _check_input_dtype(batch_valid_length.dtype, "batch_valid_length", [mstype.int32], self.cls_name)
         return True
@@ -741,6 +757,7 @@ class Baichuan13BAttention(nn.Cell):
                 ((batch_size, num_heads, head_dim, tgt_seq_length),
                 (batch_size, num_heads, tgt_seq_length, head_dim)).
     """
+
     def __init__(self,
                  batch_size,
                  seq_length,
@@ -897,6 +914,7 @@ class Baichuan13BAttention(nn.Cell):
                 self.add_past.shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
                 self.mul_past.shard(((dp, mp, 1, 1), (dp, 1, 1, 1)))
 
+    # pylint: disable=W0613
     def construct(self, x: Tensor, alibi_tensor: Tensor, mask=None,
                   key_past=None, value_past=None, batch_valid_length=None, batch_index=None):
         """Forward process of the MultiHeadAttention"""
@@ -969,12 +987,12 @@ class Baichuan13BAttention(nn.Cell):
             attention = self._merge_heads(attention)
         else:
             if self.use_causal_attention and (not self.use_past or self.is_first_iteration):
-                attention = self.causal_attention(query, key, value, alibi_tensor, mask)
+                attention = self.causal_attention(query, key, value, mask)
                 attention = self._merge_heads(attention)
             else:
-                attention = self._attn(query, key, value, alibi_tensor, mask)
+                attention = self._attn(query, key, value, mask)
         # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
-        output = self.wo(attention) # dp, mp -> dp, 1 / dp * mp, 1
+        output = self.wo(attention)  # dp, mp -> dp, 1 / dp * mp, 1
         output = self.cast(output, ori_dtype)
 
         return output, layer_present
@@ -1014,7 +1032,7 @@ class Baichuan13BAttention(nn.Cell):
         x_merge = self.reshape(x, new_shape)
         return x_merge
 
-    def _attn(self, query, key, value, alibi_tensor, mask):
+    def _attn(self, query, key, value, mask):
         """
         Get the weighted score along the seq_length
 
@@ -1031,7 +1049,7 @@ class Baichuan13BAttention(nn.Cell):
         score = self.batch_matmul_q_k(query, key)
         # score: [bs, n_head, seq/1, seq]
         score = self.mul(score, self.inv_norm_factor)
-        score = self.add_alibi(score, alibi_tensor)
+        # score = self.add_alibi(score, alibi_tensor)
 
         score = self.add(mask, score)
 
@@ -1060,6 +1078,7 @@ class NormHead(nn.Cell):
         Outputs:
             Tensor of shape :math:`(batch, seq_length, vocab_size)`.
     """
+
     def __init__(self,
                  hidden_size,
                  vocab_size,
@@ -1136,6 +1155,7 @@ class CausalAttention(nn.Cell):
     """
     CausalAttention Layer.
     """
+
     def __init__(self, parallel_config, dropout_rate=0.1, local_size=65536, block_size=128, inv_norm_factor=1):
         super(CausalAttention, self).__init__()
 
@@ -1165,7 +1185,8 @@ class CausalAttention(nn.Cell):
         self.inv_norm_factor = inv_norm_factor
         self.multiply_data = Tensor([-10000.0,], dtype=mstype.float16)
         self.mul = P.Mul()
-    def construct(self, q, k, v, alibi_tensor, attention_mask):
+
+    def construct(self, q, k, v, attention_mask):
         """Forward process of the CausalAttention"""
         bsz, head_num, tgt_len, head_dim = q.shape
         sparse_groups = tgt_len // self.block_size
@@ -1177,21 +1198,19 @@ class CausalAttention(nn.Cell):
             q_end = (i + 1) * self.block_size
             kv_begin = max(0, i - prev_block_num) * self.block_size
             kv_end = (i + 1) * self.block_size
-            # q_size = q_end - q_begin
-            # kv_size = kv_end - kv_begin
             # slice
             cur_q = self.qkv_slice(q, (0, 0, q_begin, 0), (bsz, head_num, q_end, head_dim), (1, 1, 1, 1))
             cur_k = self.qkv_slice(k, (0, 0, kv_begin, 0), (bsz, head_num, kv_end, head_dim), (1, 1, 1, 1))
             cur_v = self.qkv_slice(v, (0, 0, kv_begin, 0), (bsz, head_num, kv_end, head_dim), (1, 1, 1, 1))
             adder = self.attn_mask_slice(attention_mask, (0, 0, q_begin, kv_begin),
                                          (bsz, attention_mask.shape[1], q_end, kv_end), (1, 1, 1, 1))
-            cur_alibi_tensor = self.attn_mask_slice(alibi_tensor, (0, 0, q_begin, kv_begin),
-                                                    (bsz, alibi_tensor.shape[1], q_end, kv_end), (1, 1, 1, 1))
+            # cur_alibi_tensor = self.attn_mask_slice(alibi_tensor, (0, 0, q_begin, kv_begin),
+            #                                         (bsz, alibi_tensor.shape[1], q_end, kv_end), (1, 1, 1, 1))
             # q * k.T
             cur_score = self.qk_bmm(cur_q, cur_k)
             cur_score = self.mul(cur_score, self.inv_norm_factor)
             # adder = self.attn_mask_expand_dims(adder, 1)
-            cur_score = self.attn_mask_add(cur_alibi_tensor, cur_score)
+            # cur_score = self.attn_mask_add(cur_alibi_tensor, cur_score)
             cur_score = self.attn_mask_add(adder, cur_score)
             cur_probs = self.softmax(cur_score)
             # p * v
