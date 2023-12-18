@@ -22,8 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from packaging import version
 
-from . import CONFIG_NAME
-from .utils import ms_type_to_str
+from .utils import CONFIG_NAME, ms_type_to_str
 from .. import __version__
 from ..tools import (
     logger,
