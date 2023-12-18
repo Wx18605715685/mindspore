@@ -1,1 +1,1 @@
-mindformers/mindformers/models/auto/configuration_auto.py::from_pretrained
+mindformers/mindformers/models/auto/configuration_auto.py:from_pretrained

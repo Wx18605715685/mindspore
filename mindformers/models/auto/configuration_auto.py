@@ -1,5 +1,6 @@
 # coding=utf-8
 # Copyright 2018 The HuggingFace Inc. team.
+# Copyright 2023 Huawei Technologies Co., Ltd
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,56 +23,111 @@ from typing import List, Union
 
 from ..configuration_utils import PretrainedConfig
 from .. import CONFIG_NAME
-from ...tools import logger, get_class_from_dynamic_module, resolve_trust_remote_code
+from ...tools import logger, get_class_from_dynamic_module, resolve_trust_remote_code  # pylint: disable=W0611
 
 CONFIG_MAPPING_NAMES = OrderedDict(
     [
-        ("llama", "LlamaConfig")
-    ]
-)
-
-CONFIG_ARCHIVE_MAP_MAPPING_NAMES = OrderedDict(
-    [
-        ("llama", "LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP")
+        ("bert", "BertConfig"),
+        ("blip2", "Blip2Config"),
+        ("bloom", "BloomConfig"),
+        ("clip", "CLIPConfig"),
+        ("glm", "GLMConfig"),
+        ("glm2", "ChatGLM2Config"),
+        ("gpt2", "GPT2Config"),
+        ("llama", "LlamaConfig"),
+        ("mae", "ViTMAEConfig"),
+        ("pangualpha", "PanguAlphaConfig"),
+        ("sam", "SAMConfig"),
+        ("swin", "SwinConfig"),
+        ("t5", "T5Config"),
+        ("vit", "ViTConfig")
     ]
 )
 
 MODEL_NAMES_MAPPING = OrderedDict(
     [
-        ("llama", "LLAMA")
+        ("bert", "BertModel"),
+        ("blip2", "Blip2Llm"),
+        ("bloom", "BloomModel"),
+        ("clip", "CLIPModel"),
+        ("glm", "GLMChatModel"),
+        ("glm2", "ChatGLM2Model"),
+        ("gpt2", "GPT2Model"),
+        ("llama", "LlamaModel"),
+        ("mae", "ViTMAEModel"),
+        ("pangualpha", "PanguAlphaModel"),
+        ("sam", "Sam"),
+        ("swin", "SwinModel"),
+        ("t5", "T5ForConditionalGeneration"),
+        ("vit", "ViTModel")
     ]
 )
 
-DEPRECATED_MODELS = [
 
-]
-
-SPECIAL_MODEL_TYPE_TO_MODULE_NAME = OrderedDict(
-    [
-
-    ]
-)
-
-def model_type_to_module_name():
-    pass
-
-
-def config_class_to_model_type():
-    pass
+def config_class_to_model_type(config):
+    """Converts a config class name to the corresponding model type"""
+    for key, cls in CONFIG_MAPPING_NAMES.items():
+        if cls == config:
+            return key
+    # if key not found check in extra content
+    for key, cls in CONFIG_MAPPING._extra_content.items():  # pylint: disable=W0212
+        if cls.__name__ == config:
+            return key
+    return None
 
 
 class _LazyConfigMapping(OrderedDict):
-    pass
+    """
+    A dictionary that lazily load its values when they are requested.
+    """
+    # pylint: disable=W0231
+    def __init__(self, mapping):
+        self._mapping = mapping
+        self._extra_content = {}
+        self._modules = {}
+
+    def __getitem__(self, key):
+        """return module attributes based on module name"""
+        if key in self._extra_content:
+            return self._extra_content[key]
+        if key not in self._mapping:
+            raise KeyError(key)
+        value = self._mapping[key]
+        if key not in self._modules:
+            self._modules[key] = importlib.import_module(f".{key}", "mindformers.models")
+        if hasattr(self._modules[key], value):
+            return getattr(self._modules[key], value)
+
+        # Some of the mappings have entries model_type -> config of another model type. In that case we try to grab the
+        # object at the top level.
+        mindformers_module = importlib.import_module("mindformers")
+        return getattr(mindformers_module, value)
+
+    def keys(self):
+        return list(self._mapping.keys()) + list(self._extra_content.keys())
+
+    def values(self):
+        return [self[k] for k in self._mapping.keys()] + list(self._extra_content.values())
+
+    def items(self):
+        return [(k, self[k]) for k in self._mapping.keys()] + list(self._extra_content.items())
+
+    def __iter__(self):
+        return iter(list(self._mapping.keys()) + list(self._extra_content.keys()))
+
+    def __contains__(self, item):
+        return item in self._mapping or item in self._extra_content
+
+    def register(self, key, value, exist_ok=False):
+        """
+        Register a new configuration in this mapping.
+        """
+        if key in self._mapping.keys() and not exist_ok:
+            raise ValueError(f"'{key}' is already used by a Mindformers config, pick another name.")
+        self._extra_content[key] = value
 
 
 CONFIG_MAPPING = _LazyConfigMapping(CONFIG_MAPPING_NAMES)
-
-
-class _LazyLoadAllMappings(OrderedDict):
-    pass
-
-
-ALL_PRETRAINED_CONFIG_ARCHIVE_MAP = _LazyLoadAllMappings(CONFIG_ARCHIVE_MAP_MAPPING_NAMES)
 
 
 def _get_class_name(model_class: Union[str, List[str]]):
