@@ -24,6 +24,7 @@ import os
 # import warnings
 # from concurrent import futures
 from pathlib import Path
+import re
 from typing import Dict, Optional, Union
 from urllib.parse import urlparse
 # from uuid import uuid4
@@ -33,6 +34,7 @@ from .hub_utils import (
     mds_hub_download,
     MDS_HUB_CACHE,
     MDS_HOME,
+    REGEX_COMMIT_HASH,
     try_to_load_from_cache,
     _CACHED_NO_EXIST,
 )
@@ -277,23 +279,101 @@ def cached_file(
 
     return resolved_file
 
-def download_url():
+def download_url(url):
     raise NotImplementedError()
 
-def extract_commit_hash():
-    raise NotImplementedError()
+def extract_commit_hash(resolved_file: Optional[str], commit_hash: Optional[str]) -> Optional[str]:
+    """
+    Extracts the commit hash from a resolved filename toward a cache file.
+    """
+    if resolved_file is None or commit_hash is not None:
+        return commit_hash
+    resolved_file = str(Path(resolved_file).as_posix())
+    search = re.search(r"snapshots/([^/]+)/", resolved_file)
+    if search is None:
+        return None
+    commit_hash = search.groups()[0]
+    return commit_hash if REGEX_COMMIT_HASH.match(commit_hash) else None
 
 
 class PushToHubMixin:
     """to do"""
-    def _create_repo(self):
-        pass
+    # pylint: disable=R1711
+    def _create_repo(
+            self,
+            repo_id: str,
+            private: Optional[bool] = None,
+            token: Optional[Union[bool, str]] = None,
+            repo_url: Optional[str] = None,
+            organization: Optional[str] = None,
+    ) -> str:
+        """
+        Create the repo if needed, cleans up repo_id with deprecated kwargs `repo_url` and `organization`, retrieves
+        the token.
+        """
+        repo_id = repo_id
+        private = private
+        token = token
+        repo_url = repo_url
+        organization = organization
+        return "repo"
 
-    def _get_files_timestamps(self):
-        pass
+    def _get_files_timestamps(self, working_dir: Union[str, os.PathLike]):
+        """
+        Returns the list of files with their last modification timestamp.
+        """
+        return {f: os.path.getmtime(os.path.join(working_dir, f)) for f in os.listdir(working_dir)}
 
-    def _upload_modified_files(self):
-        pass
+    # pylint: disable=R1711
+    def _upload_modified_files(
+            self,
+            working_dir: Union[str, os.PathLike],
+            repo_id: str,
+            files_timestamps: Dict[str, float],
+            commit_message: Optional[str] = None,
+            token: Optional[Union[bool, str]] = None,
+            create_pr: bool = False,
+            revision: str = None,
+            commit_description: str = None,
+    ):
+        """
+        Uploads all modified files in `working_dir` to `repo_id`, based on `files_timestamps`.
+        """
+        working_dir = working_dir
+        repo_id = repo_id
+        files_timestamps = files_timestamps
+        commit_message = commit_message
+        token = token
+        create_pr = create_pr
+        revision = revision
+        commit_description = commit_description
+        return None
 
-    def push_to_hub(self):
-        pass
+    # pylint: disable=R1711
+    def push_to_hub(
+            self,
+            repo_id: str,
+            use_temp_dir: Optional[bool] = None,
+            commit_message: Optional[str] = None,
+            private: Optional[bool] = None,
+            token: Optional[Union[bool, str]] = None,
+            max_shard_size: Optional[Union[int, str]] = "5GB",
+            create_pr: bool = False,
+            safe_serialization: bool = True,
+            revision: str = None,
+            commit_description: str = None,
+            **deprecated_kwargs,
+    ) -> str:
+        """push to hub"""
+        repo_id = repo_id
+        use_temp_dir = use_temp_dir
+        commit_message = commit_message
+        private = private
+        token = token
+        max_shard_size = max_shard_size
+        create_pr = create_pr
+        safe_serialization = safe_serialization
+        revision = revision
+        commit_description = commit_description
+        deprecated_kwargs = deprecated_kwargs
+        return None

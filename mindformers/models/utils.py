@@ -16,6 +16,8 @@
 import mindspore.common.dtype as mstype
 from ..version_control import get_cell_reuse
 
+CONFIG_NAME = "config.json"
+
 str_to_ms_type = {
     "float16": mstype.float16,
     "float32": mstype.float32
