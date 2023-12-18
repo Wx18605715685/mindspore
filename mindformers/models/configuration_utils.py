@@ -19,8 +19,8 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
-
 from packaging import version
+from mindspore._c_expression.typing import Float
 
 from .utils import CONFIG_NAME, ms_type_to_str
 from .. import __version__
@@ -552,7 +552,7 @@ class PretrainedConfig(PushToHubMixin):
         string, which can then be stored in the json format.
         """
         for k, v in d.items():
-            if v in ms_type_to_str:
+            if isinstance(v, Float):
                 d[k] = ms_type_to_str[v]
         for value in d.values():
             if isinstance(value, dict):
