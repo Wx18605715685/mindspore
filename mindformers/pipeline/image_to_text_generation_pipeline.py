@@ -21,18 +21,16 @@ from mindspore import Tensor, Model
 from mindspore.ops import operations as P
 
 
-from mindformers.auto_class import AutoProcessor, AutoModel
-from mindformers.mindformer_book import MindFormerBook
 from mindformers.models import BaseModel, BaseImageProcessor
 from mindformers.tools.image_tools import load_image
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 
 __all__ = ['ImageToTextGenerationPipeline']
 
 
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="image_to_text_generation")
-class ImageToTextGenerationPipeline(BasePipeline):
+class ImageToTextGenerationPipeline(Pipeline):
     r"""Pipeline for image to text generation
 
     Args:
@@ -48,26 +46,11 @@ class ImageToTextGenerationPipeline(BasePipeline):
         ValueError:
             If the input model is not in support list.
     """
-    _support_list = MindFormerBook.get_pipeline_support_task_list()['image_to_text_generation'].keys()
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  image_processor: Optional[BaseImageProcessor] = None,
                  tokenizer=None,
                  **kwargs):
-        if isinstance(model, str):
-            if model in self._support_list:
-                if image_processor is None:
-                    image_processor = AutoProcessor.from_pretrained(model).image_processor
-                if not isinstance(image_processor, BaseImageProcessor):
-                    raise TypeError(f"image_processor should be inherited from"
-                                    f" BaseImageProcessor, but got {type(image_processor)}.")
-                model = AutoModel.from_pretrained(model)
-            else:
-                raise ValueError(f"{model} is not supported by ImageToTextGenerationPipeline,"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if image_processor is None:
             raise ValueError("ImageToTextGenerationPipeline"
@@ -147,8 +130,8 @@ class ImageToTextGenerationPipeline(BasePipeline):
 
         return {"image_processed": image_processed, "prompt_input_ids": prompt_input_ids}
 
-    def forward(self, model_inputs: dict,
-                **forward_params):
+    def _forward(self, model_inputs: dict,
+                 **forward_params):
         r"""The Forward Process of Model
 
         Args:

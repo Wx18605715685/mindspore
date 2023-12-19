@@ -14,30 +14,20 @@
 # ============================================================================
 
 """TextGenerationPipeline"""
-import os.path
 from typing import Optional, Union
 
 import mindspore
 from mindspore import Model, Tensor
 
-from ..auto_class import AutoConfig, AutoModel, AutoProcessor
-from ..mindformer_book import MindFormerBook
 from ..models import BaseModel, BaseTokenizer
 from ..tools.register import MindFormerModuleType, MindFormerRegister
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 
 __all__ = ['TextGenerationPipeline']
 
 
-def _setup_support_list(support_model_list):
-    support_list = []
-    for support_model in support_model_list:
-        support_list.extend(MindFormerBook.get_model_support_list().get(support_model))
-    return support_list
-
-
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="text_generation")
-class TextGenerationPipeline(BasePipeline):
+class TextGenerationPipeline(Pipeline):
     r"""Pipeline for Text Generation
 
     Args:
@@ -84,30 +74,12 @@ class TextGenerationPipeline(BasePipeline):
         >>> text_generate = TextGenerationPipeline("gpt2")
         >>> output = text_generate("I love Beijing, because ")
     """
-    _support_list = MindFormerBook.get_pipeline_support_task_list()['text_generation'].keys()
-    _model_build_kwargs = ["batch_size", "use_past", "seq_length"]
     return_name = 'text_generation'
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  tokenizer: Optional[BaseTokenizer] = None,
                  **kwargs):
         batch_size = kwargs.get("batch_size", None)
-        if isinstance(model, str):
-            if model in self._support_list or os.path.isdir(model):
-                if tokenizer is None:
-                    tokenizer = AutoProcessor.from_pretrained(model).tokenizer
-                # build model using parameters
-                model_config = AutoConfig.from_pretrained(model)
-                for build_arg in self._model_build_kwargs:
-                    model_config[build_arg] = kwargs.pop(build_arg, \
-                        model_config.get(build_arg, None))
-                model = AutoModel.from_config(model_config)
-            else:
-                raise ValueError(f"{model} is not supported by {self.__class__.__name__},"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if tokenizer is None:
             raise ValueError(f"{self.__class__.__name__}"
@@ -165,8 +137,8 @@ class TextGenerationPipeline(BasePipeline):
                                    padding=True)["input_ids"]
         return {"input_ids": input_ids}
 
-    def forward(self, model_inputs: dict,
-                **forward_params):
+    def _forward(self, model_inputs: dict,
+                 **forward_params):
         r"""The Forward Process of Model
 
         Args:

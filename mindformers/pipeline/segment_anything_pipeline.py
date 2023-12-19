@@ -21,8 +21,6 @@ import mindspore as ms
 from mindspore import ops
 from mindspore import Tensor, Model
 
-from mindformers.auto_class import AutoProcessor, AutoModel
-from mindformers.mindformer_book import MindFormerBook
 from mindformers.models import BaseModel, BaseImageProcessor
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from mindformers.models.sam import (
@@ -45,12 +43,13 @@ from mindformers.models.sam import (
     box_area,
     nms
 )
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 
 __all__ = ['SegmentAnythingPipeline']
 
+
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="segment_anything")
-class SegmentAnythingPipeline(BasePipeline):
+class SegmentAnythingPipeline(Pipeline):
     r"""Pipeline for image segment
 
     Args:
@@ -84,25 +83,10 @@ class SegmentAnythingPipeline(BasePipeline):
             {'score': 0.0014109017, 'label': 'bottlecap'}],
             ..., {'score': 0.0014109018, 'label': 'bottlecap'}]]
     """
-    _support_list = MindFormerBook.get_pipeline_support_task_list()['segment_anything'].keys()
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  image_processor: Optional[BaseImageProcessor] = None,
                  **kwargs):
-        if isinstance(model, str):
-            if model in self._support_list:
-                if image_processor is None:
-                    image_processor = AutoProcessor.from_pretrained(model).image_processor
-                if not isinstance(image_processor, BaseImageProcessor):
-                    raise TypeError(f"image_processor should be inherited from"
-                                    f" BaseImageProcessor, but got {type(image_processor)}.")
-                model = AutoModel.from_pretrained(model)
-            else:
-                raise ValueError(f"{model} is not supported by ImageClassificationForPipeline,"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if image_processor is None:
             raise ValueError("ImageClassificationFoPipeline"
@@ -253,7 +237,7 @@ class SegmentAnythingPipeline(BasePipeline):
 
         return model_inputs
 
-    def forward(self, model_inputs, **forward_params):
+    def _forward(self, model_inputs, **forward_params):
         r"""The Forward Process of Model
 
         Args:

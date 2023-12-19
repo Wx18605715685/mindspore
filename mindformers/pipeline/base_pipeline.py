@@ -1,4 +1,5 @@
 # Copyright 2022 Huawei Technologies Co., Ltd
+# Copyright 2023 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +19,9 @@
 """BasePipeline"""
 from abc import ABC, abstractmethod
 from typing import Optional, Union
+import os
 import numpy as np
+
 
 from tqdm import tqdm
 from mindspore import Tensor, Model
@@ -34,7 +37,21 @@ from ..auto_class import AutoModel
 from ..models import BaseModel, BaseTokenizer, BaseImageProcessor
 
 
-class BasePipeline(ABC):
+class _ScikitCompat(ABC):
+    """
+    Interface layer for the Scikit and Keras compatibility
+    """
+
+    @abstractmethod
+    def transform(self, *args, **kwargs):
+        raise NotImplementedError()
+
+    @abstractmethod
+    def predict(self, *args, **kwargs):
+        raise NotImplementedError()
+
+
+class Pipeline(_ScikitCompat):
     r"""
     Base Pipeline For All Task Pipelines
 
@@ -46,14 +63,33 @@ class BasePipeline(ABC):
             The tokenizer of model, it could be None if the model do not need tokenizer.
         image_processor (Optional[BaseImageProcessor]):
             The image_processor of model, it could be None if the model do not need image_processor.
+        framework (`str`, *optional*):
+            The framework to use, either `"pt"` for PyTorch or `"tf"` for TensorFlow. The specified framework must be
+            installed.
+
+            If no framework is specified, will default to the one currently installed. If no framework is specified and
+            both frameworks are installed, will default to the framework of the `model`, or to PyTorch if no model is
+            provided.
+        task (`str`, defaults to `""`):
+            A task-identifier for the pipeline.
+        binary_output (`bool`, *optional*, defaults to `False`):
+            Flag indicating if the output the pipeline should happen in a binary format (i.e., pickle) or as raw text.
     """
     _support_list = {}
 
     def __init__(self, model: Union[str, BaseModel, Model],
                  tokenizer: Optional[BaseTokenizer] = None,
+                 feature_extractor: Optional = None,
                  image_processor: Optional[BaseImageProcessor] = None,
+                 framework: Optional[str] = "ms",
+                 task: str = "",
+                 binary_output: bool = False,
                  **kwargs):
-        super(BasePipeline, self).__init__()
+        super(Pipeline, self).__init__()
+        if isinstance(model, str):
+            model = AutoModel.from_pretrained(model)
+        if not isinstance(model, (BaseModel, Model)):
+            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
         self.model = model
         if isinstance(model, str) and model in self._support_list:
             self.network = AutoModel.from_pretrained(model)
@@ -63,7 +99,11 @@ class BasePipeline(ABC):
             self.network = model.predict_network
         else:
             raise TypeError(f"model should be str or inherited from BaseModel or Model, but got type {type(model)}.")
+        self.framework = framework
+        self.task = task
+        self.binary_output = binary_output
         self.tokenizer = tokenizer
+        self.feature_extractor = feature_extractor
         self.image_processor = image_processor
         self._preprocess_params, self._forward_params, \
         self._postprocess_params = self._sanitize_parameters(**kwargs)
@@ -149,6 +189,45 @@ class BasePipeline(ABC):
         """
         raise NotImplementedError("_sanitize_parameters not implemented")
 
+    def save_pretrained(self, save_directory: str, save_name: str = 'mindspore_model'):
+        r"""Save the pipeline's model and tokenizer
+
+        Args:
+            save_directory('str'):
+                A path to the directory where to saved. It will be created if it doesn't exist
+            save_name(str): the name of saved files, including model weight and configuration file.
+                Default mindspore_model.
+        """
+        if os.path.isfile(save_directory):
+            logger.error(f"provided path ({save_directory}) should be a directory, not a file")
+            return
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        self.model.save_pretrained(save_directory, save_name)
+
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(save_directory, save_name=save_name)
+
+        if self.feature_extractor is not None:
+            self.feature_extractor.save_pretrained(save_directory, save_name)
+
+        # todo: save image_processor dep
+        if self.image_processor is not None:
+            self.image_processor.save_pretrained(save_directory, save_name)
+
+    def transform(self, *args, **kwargs):
+        """Compatibility method
+        Scikit / Keras interface to pipelines. This method will forward to __call__()
+        """
+        return self(*args, **kwargs)
+
+    def predict(self, *args, **kwargs):
+        """Compatibility method
+        Scikit / Keras interface to pipelines. This method will forward to __call__()
+        """
+        return self(*args, **kwargs)
+
     def run_single(self, inputs: Union[dict, str, np.array, Tensor],
                    preprocess_params: dict,
                    forward_params: dict,
@@ -220,7 +299,6 @@ class BasePipeline(ABC):
         """
         raise NotImplementedError("preprocess not implemented.")
 
-    @abstractmethod
     def forward(self, model_inputs: Union[dict, str, np.array, Tensor],
                 **forward_params):
         r"""The Forward Process of Model
@@ -234,7 +312,11 @@ class BasePipeline(ABC):
         Raises:
             NotImplementedError: If the method is not implemented.
         """
-        raise NotImplementedError("forward not implemented.")
+        return self._forward(model_inputs, **forward_params)
+
+    @abstractmethod
+    def _forward(self, model_inputs, **forward_params):
+        raise NotImplementedError("_forward not implemented")
 
     @abstractmethod
     def postprocess(self, model_outputs: Union[dict, str, np.array, Tensor],

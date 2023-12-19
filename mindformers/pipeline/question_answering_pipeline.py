@@ -16,25 +16,22 @@
 # ============================================================================
 
 """QuestionAnsweringPipeline"""
-import os.path
 import collections
 import math
 import six
 
-from mindspore import Tensor, Model
+from mindspore import Tensor
 from mindspore.common import dtype as mstype
 from mindformers.models import BasicTokenizer
 from ..dataset.dataloader.squad_dataloader import convert_examples_to_features, SquadExample
-from ..auto_class import AutoProcessor, AutoModel
-from ..mindformer_book import MindFormerBook
-from .base_pipeline import BasePipeline
+from .base_pipeline import Pipeline
 from ..tools.register import MindFormerRegister, MindFormerModuleType
-from ..models import BaseModel, Tokenizer
 
 __all__ = ['QuestionAnsweringPipeline']
 
+
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="question_answering")
-class QuestionAnsweringPipeline(BasePipeline):
+class QuestionAnsweringPipeline(Pipeline):
     r"""Pipeline for token classification
 
     Args:
@@ -64,24 +61,9 @@ class QuestionAnsweringPipeline(BasePipeline):
         >>> print(results)
             [{'text': 'Berlin', 'score': 0.9941, 'start': 34, 'end': 40}]
     """
-    _support_list = MindFormerBook.get_pipeline_support_task_list()['question_answering'].keys()
 
     def __init__(self, model, tokenizer, doc_stride=128, max_question_len=64, max_seq_len=384, top_k=1,
                  n_best_size=20, max_answer_len=30, **kwargs):
-        if isinstance(model, str):
-            if model in self._support_list or os.path.isdir(model):
-                if tokenizer is None:
-                    tokenizer = AutoProcessor.from_pretrained(model).tokenizer
-                model = AutoModel.from_pretrained(model)
-                if not isinstance(tokenizer, Tokenizer):
-                    raise TypeError(f"tokenizer should be inherited from"
-                                    f" BaseTokenizer, but got {type(tokenizer)}.")
-            else:
-                raise ValueError(f"{model} is not supported by {self.__class__.__name__},"
-                                 f"please selected from {self._support_list}.")
-
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
 
         if tokenizer is None:
             raise ValueError(f"{self.__class__.__name__}"
@@ -163,7 +145,7 @@ class QuestionAnsweringPipeline(BasePipeline):
 
         return features
 
-    def forward(self, model_inputs, **forward_params):
+    def _forward(self, model_inputs, **forward_params):
         """
         Forward process
 
