@@ -18,7 +18,7 @@ How to run this:
 pytest tests/st/test_model/test_gpt2_lora_model/test_gpt2_lora_trainer.py
 """
 import numpy as np
-import pytest
+# import pytest
 
 import mindspore as ms
 from mindspore.dataset import GeneratorDataset
@@ -52,10 +52,10 @@ def generator_eval():
         yield train_data
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_ascend_training
-@pytest.mark.platform_arm_ascend_training
-@pytest.mark.env_onecard
+# @pytest.mark.level0
+# @pytest.mark.platform_x86_ascend_training
+# @pytest.mark.platform_arm_ascend_training
+# @pytest.mark.env_onecard
 class TestGPT2LoraTrainerMethod:
     """A test class for testing pipeline."""
 

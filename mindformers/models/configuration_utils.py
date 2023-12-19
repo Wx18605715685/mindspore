@@ -514,6 +514,19 @@ class PretrainedConfig(PushToHubMixin):
                 serializable_config_dict[key] = value
 
         self.dict_ms_dtype_to_str(serializable_config_dict)
+        # 兼容moe config 和 parallel config
+        if "parallel_config" in serializable_config_dict:
+            diff_parallel_config = self.parallel_config.to_diff_dict()
+            if not diff_parallel_config:
+                del serializable_config_dict["parallel_config"]
+            else:
+                serializable_config_dict["parallel_config"] = diff_parallel_config
+        if "moe_config" in serializable_config_dict:
+            diff_moe_config = self.moe_config.to_diff_dict()
+            if not diff_moe_config:
+                del serializable_config_dict["moe_config"]
+            else:
+                serializable_config_dict["moe_config"] = diff_moe_config
         return serializable_config_dict
 
     def to_dict(self) -> Dict[str, Any]:
@@ -530,6 +543,11 @@ class PretrainedConfig(PushToHubMixin):
             del output["_auto_class"]
         if "_commit_hash" in output:
             del output["_commit_hash"]
+        # 兼容moe config 和 parallel config
+        if "parallel_config" in output:
+            output["parallel_config"] = output["parallel_config"].to_dict()
+        if "moe_config" in output:
+            output["moe_config"] = output["moe_config"].to_dict()
 
         # Mindformers version when serializing the model
         output["mindformers_version"] = __version__
