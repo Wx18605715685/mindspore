@@ -336,7 +336,7 @@ def get_cached_module_file(
                 importlib.invalidate_caches()
     else:
         # Get the commit hash
-        commit_hash = extract_commit_hash()
+        commit_hash = extract_commit_hash(resolved_module_file, _commit_hash)
 
         # The module file will end up being placed in a subfolder with the git hash of the repo. This way we get the
         # benefit of versioning.
