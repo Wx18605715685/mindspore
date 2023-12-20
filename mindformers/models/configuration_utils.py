@@ -576,6 +576,27 @@ class PretrainedConfig(PushToHubMixin):
             if isinstance(value, dict):
                 self.dict_ms_dtype_to_str(value)
 
+    @classmethod
+    def register_for_auto_class(cls, auto_class="AutoConfig"):
+        """
+        Register this class with a given auto class. This should only be used for custom configurations as the ones in
+        the library are already mapped with `AutoConfig`.
+
+        <Tip warning={true}>
+
+        This API is experimental and may have some slight breaking changes in the next releases.
+
+        </Tip>
+
+        Args:
+            auto_class (`str` or `type`, *optional*, defaults to `"AutoConfig"`):
+                The auto class to register this new configuration with.
+        """
+        if not isinstance(auto_class, str):
+            auto_class = auto_class.__name__
+
+        cls._auto_class = auto_class
+
 def get_configuration_file(configuration_files: List[str]) -> str:
     """
     Get the configuration file to use for this version of transformers(xxxxxx).
