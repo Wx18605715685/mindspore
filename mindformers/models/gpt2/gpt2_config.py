@@ -13,20 +13,20 @@
 # limitations under the License.
 # ============================================================================
 """Gpt Config API."""
-
+from typing import Union
+from mindspore._checkparam import args_type_check
 from mindformers.modules.transformer.moe import MoEConfig
 from mindformers.modules.transformer.transformer import default_transformer_config, default_moe_config, \
     TransformerOpParallelConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from ..utils import convert_mstype
-from ..base_config import BaseConfig
-from ...mindformer_book import MindFormerBook
+from ..configuration_utils import PretrainedConfig
 
 __all__ = ['GPT2Config']
 
 
 @MindFormerRegister.register(MindFormerModuleType.CONFIG)
-class GPT2Config(BaseConfig):
+class GPT2Config(PretrainedConfig):
     """
     Gpt config class which defines the model size
 
@@ -95,9 +95,10 @@ class GPT2Config(BaseConfig):
     Returns:
         Class, GPT2Config.
     """
+    model_type = 'gpt2'
 
-    _support_list = MindFormerBook.get_config_support_list()['gpt2']
-
+    @args_type_check(parallel_config=(dict, TransformerOpParallelConfig),
+                     moe_config=(dict, MoEConfig))
     def __init__(self,
                  batch_size: int = 1,
                  eos_token_id: int = 50256,
@@ -122,9 +123,9 @@ class GPT2Config(BaseConfig):
                  use_past: bool = False,
                  post_layernorm_residual: bool = False,
                  offset: int = 0,
-                 parallel_config: TransformerOpParallelConfig = default_transformer_config,
+                 parallel_config: Union[dict, TransformerOpParallelConfig] = default_transformer_config,
                  checkpoint_name_or_path: str = "",
-                 moe_config: MoEConfig = default_moe_config,
+                 moe_config: Union[dict, MoEConfig] = default_moe_config,
                  repetition_penalty: float = 1.0,
                  max_decode_length: int = 1024,
                  top_k: int = 5,
@@ -132,6 +133,10 @@ class GPT2Config(BaseConfig):
                  do_sample: bool = True,
                  **kwargs):
         super(GPT2Config, self).__init__(**kwargs)
+        if isinstance(parallel_config, dict):
+            parallel_config = TransformerOpParallelConfig(**parallel_config)
+        if isinstance(moe_config, dict):
+            moe_config = MoEConfig(**moe_config)
         self.batch_size = batch_size
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id

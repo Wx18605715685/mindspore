@@ -19,6 +19,7 @@ from __future__ import absolute_import
 from __future__ import division
 
 import math
+import copy
 import numpy as np
 
 from mindspore.common.tensor import Tensor
@@ -103,6 +104,21 @@ class MoEConfig:
         self.group_wise_a2a = group_wise_a2a
         self.comp_comm_parallel = comp_comm_parallel
         self.comp_comm_parallel_degree = comp_comm_parallel_degree
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, MoEConfig) and (self.to_dict() == other.to_dict())
+
+    def to_diff_dict(self):
+        config_dict = self.to_dict()
+        default_dict = MoEConfig().to_dict()
+        res_dict = {}
+        for k, v in config_dict.items():
+            if v != default_dict[k]:
+                res_dict[k] = v
+        return res_dict
+
+    def to_dict(self):
+        return copy.deepcopy(self.__dict__)
 
 
 default_moe_config = MoEConfig()
