@@ -36,8 +36,8 @@ def test_px_tokenizer():
     special_token_ids = [71, 36225, 12236]
     special_token_ids_spe = [50257]
 
-    slow_tokenizer = AutoTokenizer.from_pretrained("zyw-hw/tokenizer_test")
-    fast_tokenizer = AutoTokenizer.from_pretrained("zyw-hw/tokenizer_test", use_fast=True)
+    slow_tokenizer = AutoTokenizer.from_pretrained("mf-ut/px_tokenizer_test")
+    fast_tokenizer = AutoTokenizer.from_pretrained("mf-ut/px_tokenizer_test", use_fast=True)
 
     assert slow_tokenizer(short_string)["input_ids"] == short_string_ids
     assert fast_tokenizer(short_string)["input_ids"] == short_string_ids
@@ -95,7 +95,7 @@ def test_px_tokenizer():
     assert fast_tokenizer.decode(special_token_ids_spe) == special_token
 
     # test 外挂
-    tokenizer = AutoTokenizer.from_pretrained("zyw-hw/baichuan2", use_fast=False, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("mf-ut/baichuan2", use_fast=False, trust_remote_code=True)
 
     res = [92346, 2950, 19801, 92323, 2201, 1406, 92404, 92326, 1346, 6840, 72]
 

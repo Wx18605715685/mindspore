@@ -23,6 +23,8 @@ from typing import List, Optional, Tuple
 import regex as re
 from ..tokenization_utils import AddedToken, PreTrainedTokenizer
 from ...tools import logger
+from ...mindformer_book import MindFormerBook
+from ...tools.register import MindFormerRegister, MindFormerModuleType
 
 
 VOCAB_FILES_NAMES = {
@@ -78,6 +80,7 @@ def get_pairs(word):
     return pairs
 
 
+@MindFormerRegister.register(MindFormerModuleType.TOKENIZER)
 class GPT2Tokenizer(PreTrainedTokenizer):
     """
     Construct a GPT-2 tokenizer. Based on byte-level Byte-Pair-Encoding.
@@ -136,6 +139,7 @@ class GPT2Tokenizer(PreTrainedTokenizer):
     vocab_files_names = VOCAB_FILES_NAMES
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
     model_input_names = ["input_ids", "attention_mask"]
+    _support_list = MindFormerBook.get_tokenizer_support_list()['gpt2']
 
     def __init__(
             self,

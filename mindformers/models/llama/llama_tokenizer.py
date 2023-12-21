@@ -27,6 +27,8 @@ import sentencepiece as spm
 from ..convert_slow_tokenizer import import_protobuf
 from ..tokenization_utils import AddedToken, PreTrainedTokenizer
 from ...tools import logger
+from ...mindformer_book import MindFormerBook
+from ...tools.register import MindFormerRegister, MindFormerModuleType
 
 
 if TYPE_CHECKING:
@@ -52,6 +54,7 @@ correct. If you don't know the answer to a question, please don't share false in
 # fmt: on
 
 
+@MindFormerRegister.register(MindFormerModuleType.TOKENIZER)
 class LlamaTokenizer(PreTrainedTokenizer):
     """
         Construct a Llama tokenizer. Based on byte-level Byte-Pair-Encoding. The default padding token is unset as
@@ -126,6 +129,7 @@ class LlamaTokenizer(PreTrainedTokenizer):
     vocab_files_names = VOCAB_FILES_NAMES
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
     model_input_names = ["input_ids", "attention_mask"]
+    _support_list = MindFormerBook.get_tokenizer_support_list()['llama']
 
     def __init__(
             self,
