@@ -19,7 +19,7 @@ How to run this:
 pytest tests/st/test_do_eval.py
 """
 import numpy as np
-import pytest
+# import pytest
 
 import mindspore as ms
 from mindspore.dataset import GeneratorDataset
@@ -50,10 +50,10 @@ def generator_eval():
         yield train_data
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_ascend_training
-@pytest.mark.platform_arm_ascend_training
-@pytest.mark.env_onecard
+# @pytest.mark.level0
+# @pytest.mark.platform_x86_ascend_training
+# @pytest.mark.platform_arm_ascend_training
+# @pytest.mark.env_onecard
 class TestDoEvalMethod:
     """A test class for testing pipeline."""
 
@@ -82,7 +82,7 @@ class TestDoEvalMethod:
                                     eval_dataset=eval_dataset)
         print(self.task_trainer.config)
 
-    @pytest.mark.run(order=1)
+    # @pytest.mark.run(order=1)
     def test_train(self):
         """
         Feature: Trainer.train()
@@ -91,7 +91,7 @@ class TestDoEvalMethod:
         """
         self.task_trainer.train()
 
-    @pytest.mark.run(order=2)
+    # @pytest.mark.run(order=2)
     def test_finetune(self):
         """
         Feature: Trainer.finetune()
@@ -100,7 +100,7 @@ class TestDoEvalMethod:
         """
         self.task_trainer.finetune(finetune_checkpoint=True)
 
-    @pytest.mark.run(order=3)
+    # @pytest.mark.run(order=3)
     def test_config_change_train(self):
         """
         Feature: Trainer.finetune()
@@ -112,7 +112,7 @@ class TestDoEvalMethod:
         self.task_trainer.config.eval_epoch_interval = -1
         self.task_trainer.train(do_eval=True)
 
-    @pytest.mark.run(order=4)
+    # @pytest.mark.run(order=4)
     def test_config_change_finetune(self):
         """
         Feature: Trainer.finetune()

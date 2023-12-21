@@ -17,6 +17,8 @@ import mindspore.common.dtype as mstype
 from ..version_control import get_cell_reuse
 
 CONFIG_NAME = "config.json"
+WEIGHTS_NAME = "mindspore_model.ckpt"
+WEIGHTS_INDEX_NAME = "mindspore_model.ckpt.index.json"
 
 str_to_ms_type = {
     "float16": mstype.float16,

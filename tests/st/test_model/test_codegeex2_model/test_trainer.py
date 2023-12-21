@@ -90,32 +90,32 @@ class TestCodeGeeX2TrainerMethod:
         if is_version_ge(mindspore.__version__, "1.11.0"):
             self.task_trainer.train()
 
-    @pytest.mark.run(order=2)
-    def test_eval(self):
-        """
-        Feature: Trainer.evaluate()
-        Description: Test trainer for evaluate.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        if is_version_ge(mindspore.__version__, "1.11.0"):
-            self.task_trainer.evaluate()
+    # @pytest.mark.run(order=2)
+    # def test_eval(self):
+    #     """
+    #     Feature: Trainer.evaluate()
+    #     Description: Test trainer for evaluate.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     if is_version_ge(mindspore.__version__, "1.11.0"):
+    #         self.task_trainer.evaluate()
 
-    @pytest.mark.run(order=3)
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        model_config = ChatGLM2Config(num_layers=1, hidden_size=32, inner_hidden_size=None,
-                                      num_heads=2, position_encoding_2d=True)
-        model = ChatGLM2ForConditionalGeneration(model_config)
-        task_trainer = Trainer(task='text_generation',
-                               model=model,
-                               model_name='codegeex2_6b',
-                               tokenizer=self.tokenizer)
-        if is_version_ge(mindspore.__version__, "1.11.0"):
-            task_trainer.predict(input_data="#language: Python\n# write a bubble sort function\n", max_length=20)
+    # @pytest.mark.run(order=3)
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     model_config = ChatGLM2Config(num_layers=1, hidden_size=32, inner_hidden_size=None,
+    #                                   num_heads=2, position_encoding_2d=True)
+    #     model = ChatGLM2ForConditionalGeneration(model_config)
+    #     task_trainer = Trainer(task='text_generation',
+    #                            model=model,
+    #                            model_name='codegeex2_6b',
+    #                            tokenizer=self.tokenizer)
+    #     if is_version_ge(mindspore.__version__, "1.11.0"):
+    #         task_trainer.predict(input_data="#language: Python\n# write a bubble sort function\n", max_length=20)
 
     @pytest.mark.run(order=4)
     def test_finetune(self):

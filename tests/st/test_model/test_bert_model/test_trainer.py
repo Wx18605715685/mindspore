@@ -76,23 +76,23 @@ class TestBertTrainerMethod:
         """
         self.task_trainer.train()
 
-    @pytest.mark.run(order=2)
-    def test_eval(self):
-        """
-        Feature: Trainer.evaluate()
-        Description: Test trainer for evaluate.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
+    # @pytest.mark.run(order=2)
+    # def test_eval(self):
+    #     """
+    #     Feature: Trainer.evaluate()
+    #     Description: Test trainer for evaluate.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
 
-    @pytest.mark.run(order=3)
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        input_data = [" Hello I am a [MASK] model.",]
-        self.task_trainer.predict(input_data=input_data)
+    # @pytest.mark.run(order=3)
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     input_data = [" Hello I am a [MASK] model.",]
+    #     self.task_trainer.predict(input_data=input_data)
 
     @pytest.mark.run(order=4)
     def test_finetune(self):

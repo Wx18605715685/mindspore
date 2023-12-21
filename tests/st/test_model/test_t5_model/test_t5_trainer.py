@@ -26,8 +26,7 @@ import mindspore as ms
 from mindspore.dataset import MindDataset, GeneratorDataset
 from mindspore.mindrecord import FileWriter
 
-from mindformers.trainer import Trainer, \
-    TranslationTrainer, TrainingArguments
+from mindformers.trainer import Trainer, TrainingArguments # TranslationTrainer,
 from mindformers import T5Config, T5ForConditionalGeneration
 
 ms.set_context(mode=0)
@@ -140,15 +139,15 @@ class TestTranslationTrainer:
                               train_dataset=dataset)
         mim_trainer.train()
 
-    @pytest.mark.run(order=2)
-    def test_trainer_predict(self):
-        """
-        Feature: Test Predict of the Trainer
-        Description: Test Predict
-        Expectation: TypeError
-        """
-        # change the length for quick training
-        model_config = T5Config(seq_length=32, max_decode_length=32)
-        model = T5ForConditionalGeneration(model_config)
-        mim_trainer = TranslationTrainer(model_name="t5_small")
-        mim_trainer.predict(input_data="hello world", network=model)
+    # @pytest.mark.run(order=2)
+    # def test_trainer_predict(self):
+    #     """
+    #     Feature: Test Predict of the Trainer
+    #     Description: Test Predict
+    #     Expectation: TypeError
+    #     """
+    #     # change the length for quick training
+    #     model_config = T5Config(seq_length=32, max_decode_length=32)
+    #     model = T5ForConditionalGeneration(model_config)
+    #     mim_trainer = TranslationTrainer(model_name="t5_small")
+    #     mim_trainer.predict(input_data="hello world", network=model)

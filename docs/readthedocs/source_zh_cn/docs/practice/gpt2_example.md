@@ -969,7 +969,7 @@ GPT2作为大语言模型，其主要的task是文本生成和对话问答方面
     ```python
     # text_generator.py
     # 以下展示了部分核心代码，具体实现请参考Mindformers
-    class GeneratorMixin:
+    class GenerationMixin:
         """class description"""
         def __init__(self):
             pass  

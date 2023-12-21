@@ -29,17 +29,27 @@ from mindformers.modules.layers import LayerNorm, Dropout, Linear
 from mindformers.core.loss import CrossEntropyLoss
 from mindformers.modules.transformer import AttentionMask, VocabEmbedding
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from mindformers.models.base_model import BaseModel
 from mindformers.mindformer_book import MindFormerBook
 from mindformers.tools.logger import logger
+from mindformers.models.modeling_utils import PreTrainedModel
 from .gpt2_config import GPT2Config
 from .gpt_modules import GPTTransformerDecoderLayer
 
 __all__ = ['GPT2LMHeadModel', 'GPT2ForSequenceClassification', 'GPT2Model', 'GPTHead']
 
 
+class GPT2PreTrainedModel(PreTrainedModel):
+    """
+    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    models.
+    """
+
+    config_class = GPT2Config
+    base_model_prefix = "gpt2"
+
+
 @MindFormerRegister.register(MindFormerModuleType.MODELS)
-class GPT2LMHeadModel(BaseModel):
+class GPT2LMHeadModel(GPT2PreTrainedModel):
     r"""
         Provide gpt training loss or logits through network.
         Args:
@@ -88,7 +98,6 @@ class GPT2LMHeadModel(BaseModel):
         self.loss = CrossEntropyLoss(parallel_config=loss_parallel_config)
         self.reshape = P.Reshape()
         self.cast = P.Cast()
-        self.load_checkpoint(config)
         self.add = P.Add().shard(((parallel_config.data_parallel, 1), ()))
         self.tile = P.Tile()
         self.is_first_iteration = True
@@ -186,7 +195,7 @@ class GPT2LMHeadModel(BaseModel):
 
 
 @MindFormerRegister.register(MindFormerModuleType.MODELS)
-class GPT2ForSequenceClassification(BaseModel):
+class GPT2ForSequenceClassification(GPT2PreTrainedModel):
     r"""
         Provide gpt training loss or logits through network.
         Args:
@@ -241,7 +250,6 @@ class GPT2ForSequenceClassification(BaseModel):
 
         self.reshape = P.Reshape()
         self.cast = P.Cast()
-        self.load_checkpoint(config)
         self.reduce_sum = P.ReduceSum().shard(((dp, 1),))
         self.add = P.Add().shard(((dp,), (dp,)))
         self.sub = P.Sub().shard(((1,), ()))
@@ -368,7 +376,7 @@ def set_parallel_configure_for_layer(network, layer_id, offset, parallel_config,
             network.recompute(recompute_slice_activation=parallel_config.recompute.recompute_slice_activation)
 
 
-class GPT2Model(nn.Cell):
+class GPT2Model(GPT2PreTrainedModel):
     """
     The backbone of GPT network
 
@@ -386,7 +394,7 @@ class GPT2Model(nn.Cell):
     """
 
     def __init__(self, config):
-        super(GPT2Model, self).__init__()
+        super(GPT2Model, self).__init__(config)
         self.config = config
         self.embedding = GPTEmbeddingLayer(config)
         self.embedding.pipeline_stage = 0

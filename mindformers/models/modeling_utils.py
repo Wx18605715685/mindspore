@@ -1,0 +1,1007 @@
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team.
+# Copyright 2023 Huawei Technologies Co., Ltd
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+""" Configuration PreTrainedModel."""
+import json
+import os
+import re
+from functools import partial
+from typing import Dict, Optional, Union
+
+import mindspore as ms
+from mindspore import nn
+from mindspore import load_checkpoint, load_param_into_net
+
+from mindformers.tools.hub import PushToHubMixin, cached_file, download_url, extract_commit_hash, is_offline_mode, is_remote_url
+from mindformers.tools.hub.dynamic_module_utils import custom_object_save
+from mindformers.generation import GenerationConfig, GenerationMixin
+from mindformers.tools.logger import logger
+
+from .configuration_utils import PretrainedConfig
+from .utils import CONFIG_NAME, WEIGHTS_NAME, WEIGHTS_INDEX_NAME
+
+
+# temp
+def convert_file_size_to_int(size: Union[int, str]):
+    """
+    Converts a size expressed as a string with digits an unit (like `"5MB"`) to an integer (in bytes).
+
+    Args:
+        size (`int` or `str`): The size to convert. Will be directly returned if an `int`.
+
+    Example:
+    ```py
+    >>> convert_file_size_to_int("1MiB")
+    1048576
+    ```
+    """
+    if isinstance(size, int):
+        return size
+    if size.upper().endswith("GIB"):
+        return int(size[:-3]) * (2**30)
+    if size.upper().endswith("MIB"):
+        return int(size[:-3]) * (2**20)
+    if size.upper().endswith("KIB"):
+        return int(size[:-3]) * (2**10)
+    if size.upper().endswith("GB"):
+        int_size = int(size[:-2]) * (10**9)
+        return int_size // 8 if size.endswith("b") else int_size
+    if size.upper().endswith("MB"):
+        int_size = int(size[:-2]) * (10**6)
+        return int_size // 8 if size.endswith("b") else int_size
+    if size.upper().endswith("KB"):
+        int_size = int(size[:-2]) * (10**3)
+        return int_size // 8 if size.endswith("b") else int_size
+    raise ValueError("`size` is not in a valid format. Use an integer followed by the unit, e.g., '5GB'.")
+def get_checkpoint_shard_files(pretrained_model_name_or_path, index_filename, subfolder, **kwargs):
+    with open(index_filename, "r") as f:
+        index = json.loads(f.read())
+    shard_filenames = sorted(set(index["weight_map"].values()))
+    shard_filenames = [os.path.join(pretrained_model_name_or_path, subfolder, f) for f in shard_filenames]
+    return shard_filenames, kwargs
+
+
+def dtype_byte_size(dtype):
+    """
+    Returns the size (in bytes) occupied by one parameter of type `dtype`.
+
+    Example:
+
+    ```py
+    >>> dtype_byte_size(mindspore.float32)
+    4
+    ```
+    """
+    if dtype == ms.bool_:
+        return 1 / 8
+    bit_search = re.search(r"[^\d](\d+)$", str(dtype))
+    if bit_search is None:
+        raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
+    bit_size = int(bit_search.groups()[0])
+    return bit_size // 8
+
+
+def save_checkpoint(save_obj, save_directory):
+    ckpt_file_name = os.path.join(save_directory, WEIGHTS_NAME)
+    ms.save_checkpoint(save_obj, ckpt_file_name)
+
+
+def shard_checkpoint(
+        state_dict: Dict[str, ms.Parameter], max_shard_size: Union[int, str] = "10GB", weights_name: str = WEIGHTS_NAME
+):
+    """
+    Splits a model state dictionary in sub-checkpoints so that the final size of each sub-checkpoint does not exceed a
+    given size.
+
+    The sub-checkpoints are determined by iterating through the `state_dict` in the order of its keys, so there is no
+    optimization made to make each sub-checkpoint as close as possible to the maximum size passed. For example, if the
+    limit is 10GB and we have weights of sizes [6GB, 6GB, 2GB, 6GB, 2GB, 2GB] they will get sharded as [6GB], [6+2GB],
+    [6+2+2GB] and not [6+2+2GB], [6+2GB], [6GB].
+
+    <Tip warning={true}>
+
+    If one of the model's weight is bigger than `max_shard_size`, it will end up in its own sub-checkpoint which will
+    have a size greater than `max_shard_size`.
+
+    </Tip>
+
+    Args:
+        state_dict (`Dict[str, mindspore.Parameter]`): The state dictionary of a model to save.
+        max_shard_size (`int` or `str`, *optional*, defaults to `"10GB"`):
+            The maximum size of each sub-checkpoint. If expressed as a string, needs to be digits followed by a unit
+            (like `"5MB"`).
+        weights_name (`str`, *optional*, defaults to `"mindspore_model.ckpt"`):
+            The name of the model save file.
+    """
+    max_shard_size = convert_file_size_to_int(max_shard_size)
+
+    sharded_state_dict_lists = [{}]
+    last_block_size = 0
+    total_size = 0
+
+    for name, weight in state_dict.items():
+        weight_size = weight.numel() * dtype_byte_size(weight.dtype)
+
+        # If this weight is going to tip up over the maximal size, we split, but only if we have put at least one
+        # weight in the current shard.
+        if last_block_size + weight_size > max_shard_size and sharded_state_dict_lists[-1]:
+            sharded_state_dict_lists.append({})
+            last_block_size = 0
+
+        sharded_state_dict_lists[-1][name] = weight
+        last_block_size += weight_size
+        total_size += weight_size
+
+    # If we only have one shard, we return it
+    if len(sharded_state_dict_lists) == 1:
+        return {weights_name: sharded_state_dict_lists[0]}, None
+
+    # Otherwise, let's build the index
+    weight_map = {}
+    shards = {}
+    for idx, shard in enumerate(sharded_state_dict_lists):
+        shard_file = weights_name.replace(".ckpt", f"-{idx+1:05d}-of-{len(sharded_state_dict_lists):05d}.ckpt")
+        shards[shard_file] = shard
+        for key in shard.keys():
+            weight_map[key] = shard_file
+
+    # Add the metadata
+    metadata = {"total_size": total_size}
+    index = {"metadata": metadata, "weight_map": weight_map}
+    return shards, index
+
+def load_sharded_checkpoint(model, folder, strict=True):
+    """
+    load checkpoint from a sharded checkpoint.
+
+    This load is performed efficiently: each checkpoint shard is loaded one by one in RAM and deleted after being
+    loaded in the model.
+
+    Args:
+        model (`torch.nn.Module`): The model in which to load the checkpoint.
+        folder (`str` or `os.PathLike`): A path to a folder containing the sharded checkpoint.
+        strict (`bool`, *optional`, defaults to `True`):
+            Whether to strictly enforce that the keys in the model state dict match the keys in the sharded checkpoint.
+
+    Returns:
+        `NamedTuple`: A named tuple with `missing_keys` and `unexpected_keys` fields
+            - `missing_keys` is a list of str containing the missing keys
+            - `unexpected_keys` is a list of str containing the unexpected keys
+    """
+    # Load the index
+    index_file = os.path.join(folder, WEIGHTS_INDEX_NAME)
+    with open(index_file, "r", encoding="utf-8") as f:
+        index = json.load(f)
+    shard_files = list(set(index["weight_map"].values()))
+    shard_files = [os.path.join(folder, f) for f in shard_files]
+
+    state_dict = {}
+    for shard_file in shard_files:
+        state_dict.update(load_checkpoint(shard_file))
+
+    # load params into net
+    not_load_network_params = load_param_into_net(model, state_dict, strict_load=strict)
+    logger.info("Network parameters are not loaded: %s", str(not_load_network_params))
+    return not_load_network_params
+
+def _add_variant(weights_name: str, variant: Optional[str] = None) -> str:
+    if variant is not None:
+        splits = weights_name.split(".")
+        splits = splits[:-1] + [variant] + splits[-1:]
+        weights_name = ".".join(splits)
+
+    return weights_name
+
+class ModuleUtilsMixin:
+    """
+    A few utilities for `mindspore.nn.Cell`, to be used as a mixin.
+    """
+
+
+class PreTrainedModel(nn.Cell, ModuleUtilsMixin, GenerationMixin, PushToHubMixin):
+    r"""
+    Base class for all models.
+
+    [`PreTrainedModel`] takes care of storing the configuration of the models and handles methods for loading,
+    downloading and saving models as well as a few methods common to all models to:
+
+        - resize the input embeddings,
+        - prune heads in the self-attention heads.
+
+    Class attributes (overridden by derived classes):
+
+        - **config_class** ([`PretrainedConfig`]) -- A subclass of [`PretrainedConfig`] to use as configuration class
+          for this model architecture.
+        - **base_model_prefix** (`str`) -- A string indicating the attribute associated to the base model in derived
+          classes of the same architecture adding modules on top of the base model.
+        - **is_parallelizable** (`bool`) -- A flag indicating whether this model supports model parallelization.
+        - **main_input_name** (`str`) -- The name of the principal input to the model (often `input_ids` for NLP
+          models, `pixel_values` for vision models and `input_values` for speech models).
+    """
+    config_class = None
+    base_model_prefix = ""
+    main_input_name = "input_ids"
+    _auto_class = None
+    # _no_split_modules = None
+    _skip_keys_device_placement = None
+    _keep_in_fp32_modules = None
+
+    # a list of `re` patterns of `state_dict` keys that should be removed from the list of missing
+    # keys we find (keys inside the model but not in the checkpoint) and avoid unnecessary warnings.
+    _keys_to_ignore_on_load_missing = None
+    # a list of `re` patterns of `state_dict` keys that should be removed from the list of
+    # unexpected keys we find (keys inside the checkpoint but not the model) and avoid unnecessary
+    # warnings.
+    _keys_to_ignore_on_load_unexpected = None
+    # a list of `state_dict` keys to ignore when saving the model (useful for keys that aren't
+    # trained, but which are either deterministic or tied variables)
+    _keys_to_ignore_on_save = None
+    # a list of `state_dict` keys that are potentially tied to another key in the state_dict.
+    _tied_weights_keys = None
+
+    is_parallelizable = False
+    supports_gradient_checkpointing = False
+
+    # Flash Attention 2 support
+    _supports_flash_attn_2 = False
+
+    @property
+    def framework(self) -> str:
+        """
+        :str: Identifies that this is a Mindspore model.
+        """
+        return "ms"
+
+    # pylint: disable=W0613
+    def __init__(self, config: PretrainedConfig, *inputs, **kwargs):
+        super().__init__()
+        if not isinstance(config, PretrainedConfig):
+            raise ValueError(
+                f"Parameter config in `{self.__class__.__name__}(config)` should be an instance of class "
+                "`PretrainedConfig`. To create a model from a pretrained model use "
+                f"`model = {self.__class__.__name__}.from_pretrained(PRETRAINED_MODEL_NAME)`"
+            )
+        # Save config and origin of the pretrained weights if given in model
+        self.config = config
+        self.name_or_path = config.name_or_path
+        self.warning_issued = {}
+        self.generation_config = GenerationConfig.from_model_config(config) if self.can_generate() else None
+
+    def post_init(self):
+        """
+        A method executed at the end of each Transformer model initialization, to execute code that needs the model's
+        modules properly initialized (such as weight initialization).
+        """
+        self.init_weights()
+
+    @classmethod
+    def _from_config(cls, config, **kwargs):
+        """
+        All context managers that the model should be initializee under go here.
+
+        Args:
+            ms_dtype (`mindspore.dtype`, *optional*):
+                Override the default `mindspore.dtype` and load the model under this dtype.
+        """
+        # ignore set default type
+        model = cls(config, **kwargs)
+        return model
+
+    @property
+    def base_model(self) -> nn.Cell:
+        """
+        `mindspore.nn.Module`: The main body of the model.
+        """
+        return getattr(self, self.base_model_prefix, self)
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        """
+        Returns whether this model can generate sequences with `.generate()`.
+
+        Returns:
+            `bool`: Whether this model can generate sequences with `.generate()`.
+        """
+        # Detects whether `prepare_inputs_for_generation` has been overwritten, which is a requirement for generation.
+        # Alternativelly, the model can also have a custom `generate` function.
+        if "GenerationMixin" in str(cls.prepare_inputs_for_generation) and "GenerationMixin" in str(cls.generate):
+            return False
+        return True
+
+    def save_pretrained(
+            self,
+            save_directory: Union[str, os.PathLike],
+            is_main_process: bool = True,
+            state_dict: Optional[dict] = None, # state_dict
+            push_to_hub: bool = False,
+            max_shard_size: Union[int, str] = "5GB",
+            variant: Optional[str] = None,
+            token: Optional[Union[str, bool]] = None,
+            **kwargs,
+    ):
+        """
+        Save a model and its configuration file to a directory, so that it can be re-loaded using the
+        [`~PreTrainedModel.from_pretrained`] class method.
+
+        Arguments:
+            save_directory (`str` or `os.PathLike`):
+                Directory to which to save. Will be created if it doesn't exist.
+            is_main_process (`bool`, *optional*, defaults to `True`):
+                Whether the process calling this is the main process or not. Useful when in distributed training like
+                TPUs and need to call this function on all processes. In this case, set `is_main_process=True` only on
+                the main process to avoid race conditions.
+            state_dict (nested dictionary of mindspore.Parameter):
+                The state dictionary of the model to save. Will default to `mindspore.load_checkpoint()`, but can be
+                used to only save parts of the model or if special precautions need to be taken when recovering the
+                state dictionary of a model (like when using model parallelism).
+            push_to_hub (`bool`, *optional*, defaults to `False`):
+                Whether or not to push your model to the Hugging Face model hub after saving it. You can specify the
+                repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
+                namespace).
+            max_shard_size (`int` or `str`, *optional*, defaults to `"5GB"`):
+                The maximum size for a checkpoint before being sharded. Checkpoints shard will then be each of size
+                lower than this size. If expressed as a string, needs to be digits followed by a unit (like `"5MB"`).
+                We default it to 5GB in order for models to be able to run easily on free-tier google colab instances
+                without CPU OOM issues.
+
+                <Tip warning={true}>
+
+                If a single weight of the model is bigger than `max_shard_size`, it will be in its own checkpoint shard
+                which will be bigger than `max_shard_size`.
+
+                </Tip>
+
+            variant (`str`, *optional*):
+                If specified, weights are saved in the format pytorch_model.<variant>.bin.
+            token (`str` or `bool`, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
+                the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
+            kwargs (`Dict[str, Any]`, *optional*):
+                Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
+        """
+        if token is not None:
+            kwargs["token"] = token
+
+        if os.path.isfile(save_directory):
+            logger.error(f"Provided path ({save_directory}) should be a directory, not a file")
+            return
+
+        os.makedirs(save_directory, exist_ok=True)
+
+        if push_to_hub:
+            commit_message = kwargs.pop("commit_message", None)
+            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
+            repo_id = self._create_repo(repo_id, **kwargs)
+            files_timestamps = self._get_files_timestamps(save_directory)
+
+        model_to_save = self
+        # Attach architecture to the config
+        model_to_save.config.architectures = [model_to_save.__class__.__name__]
+
+        # If we have a custom model, we copy the file defining it in the folder and set the attributes so it can be
+        # loaded from the Hub.
+        if self._auto_class is not None:
+            custom_object_save(self, save_directory, config=self.config)
+
+        # Save the config
+        if is_main_process:
+            model_to_save.config.save_pretrained(save_directory)
+            # if self.can_generate():
+            #     model_to_save.generation_config.save_pretrained(save_directory)
+
+        if state_dict is None:
+        # Save the model
+            state_dict = {}
+            for item in model_to_save.get_parameters():
+                state_dict[item.name] = item.data
+                # params_list.append({"name": item.name, "data": item.data})
+
+        # Handle the case where some param_list keys shouldn't be saved
+        def choice_func(x, keys_to_ignore_on_save):
+            if keys_to_ignore_on_save is not None:
+                for k in keys_to_ignore_on_save:
+                    if k in x:
+                        return False
+                return True
+            return True
+
+        weights_name = _add_variant(WEIGHTS_NAME, variant)
+
+        shards, index = shard_checkpoint(state_dict, max_shard_size=max_shard_size, weights_name=weights_name)
+
+        # Clean the folder from a previous save
+        for filename in os.listdir(save_directory):
+            full_filename = os.path.join(save_directory, filename)
+            # If we have a shard file that is not going to be replaced, we delete it, but only from the main process
+            # in distributed settings to avoid race conditions.
+            weights_no_suffix = weights_name.replace(".ckpt", "")
+
+            # make sure that file to be deleted matches format of sharded file, e.g. pytorch_model-00001-of-00005
+            filename_no_suffix = filename.replace(".ckpt", "")
+            reg = re.compile(r"(.*?)-\d{5}-of-\d{5}")
+
+            if (
+                    filename.startswith(weights_no_suffix)
+                    and os.path.isfile(full_filename)
+                    and filename not in shards.keys()
+                    and is_main_process
+                    and reg.fullmatch(filename_no_suffix) is not None
+            ):
+                os.remove(full_filename)
+
+        # Save the model
+        for shard_file, shard in shards.items():
+            ms.save_checkpoint(shard, os.path.join(save_directory, shard_file), \
+                               choice_func=partial(choice_func, keys_to_ignore_on_save=self._keys_to_ignore_on_save))
+
+        if index is None:
+            path_to_weights = os.path.join(save_directory, _add_variant(WEIGHTS_NAME, variant))
+            logger.info(f"Model weights saved in {path_to_weights}")
+        else:
+            save_index_file = os.path.join(save_directory, _add_variant(WEIGHTS_INDEX_NAME, variant))
+            # Save the index as well
+            with open(save_index_file, "w", encoding="utf-8") as f:
+                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
+                f.write(content)
+            logger.info(
+                f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "
+                f"split in {len(shards)} checkpoint shards. You can find where each parameters has been saved in the "
+                f"index located at {save_index_file}."
+            )
+
+        if push_to_hub:
+            self._upload_modified_files(
+                save_directory,
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=token,
+            )
+
+    @classmethod
+    def from_pretrained(
+            cls,
+            pretrained_model_name_or_path: Optional[Union[str, os.PathLike]],
+            *model_args,
+            config: Optional[Union[PretrainedConfig, str, os.PathLike]] = None,
+            cache_dir: Optional[Union[str, os.PathLike]] = None,
+            ignore_mismatched_sizes: bool = False,
+            force_download: bool = False,
+            local_files_only: bool = False,
+            token: Optional[Union[str, bool]] = None,
+            revision: str = "main",
+            **kwargs,
+    ):
+        r"""
+        Instantiate a pretrained mindspore model from a pre-trained model configuration.
+
+        The model is set in evaluation mode by default using `model.set_train(False)` (Dropout modules are deactivated).
+        To train the model, you should first set it back in training mode with `model.set_train(True)`.
+
+        The warning *Weights from XXX not initialized from pretrained model* means that the weights of XXX do not come
+        pretrained with the rest of the model. It is up to you to train those weights with a downstream fine-tuning
+        task.
+
+        The warning *Weights from XXX not used in YYY* means that the layer XXX is not used by YYY, therefore those
+        weights are discarded.
+
+        Parameters:
+            pretrained_model_name_or_path (`str` or `os.PathLike`, *optional*):
+                Can be either:
+
+                    - A string, the *model id* of a pretrained model hosted inside a model repo on huggingface.co.
+                      Valid model ids can be located at the root-level, like `bert-base-uncased`, or namespaced under a
+                      user or organization name, like `dbmdz/bert-base-german-cased`.
+                    - A path to a *directory* containing model weights saved using
+                      [`~PreTrainedModel.save_pretrained`], e.g., `./my_model_directory/`.
+                    - A path or url to a *tensorflow index checkpoint file* (e.g, `./tf_model/model.ckpt.index`). In
+                      this case, `from_tf` should be set to `True` and a configuration object should be provided as
+                      `config` argument. This loading path is slower than converting the TensorFlow checkpoint in a
+                      PyTorch model using the provided conversion scripts and loading the PyTorch model afterwards.
+                    - A path or url to a model folder containing a *flax checkpoint file* in *.msgpack* format (e.g,
+                      `./flax_model/` containing `flax_model.msgpack`). In this case, `from_flax` should be set to
+                      `True`.
+                    - `None` if you are both providing the configuration and state dictionary (resp. with keyword
+                      arguments `config` and `state_dict`).
+            model_args (sequence of positional arguments, *optional*):
+                All remaining positional arguments will be passed to the underlying model's `__init__` method.
+            config (`Union[PretrainedConfig, str, os.PathLike]`, *optional*):
+                Can be either:
+
+                    - an instance of a class derived from [`PretrainedConfig`],
+                    - a string or path valid as input to [`~PretrainedConfig.from_pretrained`].
+
+                Configuration for the model to use instead of an automatically loaded configuration. Configuration can
+                be automatically loaded when:
+
+                    - The model is a model provided by the library (loaded with the *model id* string of a pretrained
+                      model).
+                    - The model was saved using [`~PreTrainedModel.save_pretrained`] and is reloaded by supplying the
+                      save directory.
+                    - The model is loaded by supplying a local directory as `pretrained_model_name_or_path` and a
+                      configuration JSON file named *config.json* is found in the directory.
+            state_dict (`Dict[str, mindspore.Parameter]`, *optional*):
+                A state dictionary to use instead of a state dictionary loaded from saved weights file.
+
+                This option can be used if you want to create a model from a pretrained configuration but load your own
+                weights. In this case though, you should check if using [`~PreTrainedModel.save_pretrained`] and
+                [`~PreTrainedModel.from_pretrained`] is not a simpler option.
+            cache_dir (`Union[str, os.PathLike]`, *optional*):
+                Path to a directory in which a downloaded pretrained model configuration should be cached if the
+                standard cache should not be used.
+            ignore_mismatched_sizes (`bool`, *optional*, defaults to `False`):
+                Whether or not to raise an error if some of the weights from the checkpoint do not have the same size
+                as the weights of the model (if for instance, you are instantiating a model with 10 labels from a
+                checkpoint with 3 labels).
+            force_download (`bool`, *optional*, defaults to `False`):
+                Whether or not to force the (re-)download of the model weights and configuration files, overriding the
+                cached versions if they exist.
+            resume_download (`bool`, *optional*, defaults to `False`):
+                Whether or not to delete incompletely received files. Will attempt to resume the download if such a
+                file exists.
+            proxies (`Dict[str, str]`, *optional*):
+                A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
+                'http://hostname': 'foo.bar:4012'}`. The proxies are used on each request.
+            output_loading_info(`bool`, *optional*, defaults to `False`):
+                Whether ot not to also return a dictionary containing missing keys, unexpected keys and error messages.
+            local_files_only(`bool`, *optional*, defaults to `False`):
+                Whether or not to only look at local files (i.e., do not try to download the model).
+            token (`str` or `bool`, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
+                the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
+            revision (`str`, *optional*, defaults to `"main"`):
+                The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+                git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
+                identifier allowed by git.
+
+                <Tip>
+
+                To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>".
+
+                </Tip>
+
+            subfolder (`str`, *optional*, defaults to `""`):
+                In case the relevant files are located inside a subfolder of the model repo on huggingface.co, you can
+                specify the folder name here.
+            variant (`str`, *optional*):
+                If specified load weights from `variant` filename, *e.g.* pytorch_model.<variant>.bin. `variant` is
+                ignored when using `from_tf` or `from_flax`.
+
+            kwargs (remaining dictionary of keyword arguments, *optional*):
+                Can be used to update the configuration object (after it being loaded) and initiate the model.
+                Behaves differently depending on whether a `config` is provided or automatically loaded:
+
+                    - If a configuration is provided with `config`, `**kwargs` will be directly passed to the
+                      underlying model's `__init__` method (we assume all relevant updates to the configuration have
+                      already been done)
+                    - If a configuration is not provided, `kwargs` will be first passed to the configuration class
+                      initialization function ([`~PretrainedConfig.from_pretrained`]). Each key of `kwargs` that
+                      corresponds to a configuration attribute will be used to override said attribute with the
+                      supplied `kwargs` value. Remaining keys that do not correspond to any configuration attribute
+                      will be passed to the underlying model's `__init__` function.
+
+        <Tip>
+
+        Activate the special ["offline-mode"](XXX) to
+        use this method in a firewalled environment.
+
+        </Tip>
+
+        Examples:
+
+        ```python
+        >>> from mindformers import GPT2Model
+
+        >>> # Download model and configuration from huggingface.co and cache.
+        >>> model = GPT2Model.from_pretrained("XXX")
+        >>> # Model was saved using *save_pretrained('./test/saved_model/')* (for example purposes, not runnable).
+        >>> model = GPT2Model.from_pretrained("./test/saved_model/")
+        ```
+        """
+        state_dict = kwargs.pop("state_dict", None)
+        resume_download = kwargs.pop("resume_download", False)
+        proxies = kwargs.pop("proxies", None)
+        output_loading_info = kwargs.pop("output_loading_info", False)
+        trust_remote_code = kwargs.pop("trust_remote_code", None)
+        _ = kwargs.pop("mirror", None)
+        from_pipeline = kwargs.pop("_from_pipeline", None)
+        from_auto_class = kwargs.pop("_from_auto", False)
+        subfolder = kwargs.pop("subfolder", "")
+        commit_hash = kwargs.pop("_commit_hash", None)
+        variant = kwargs.pop("variant", None)
+
+        if trust_remote_code is True:
+            logger.warning(
+                "The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is"
+                " ignored."
+            )
+
+        if commit_hash is None:
+            if not isinstance(config, PretrainedConfig):
+                # We make a call to the config file first (which may be absent) to get the commit hash as soon as possible
+                resolved_config_file = cached_file(
+                    pretrained_model_name_or_path,
+                    CONFIG_NAME,
+                    cache_dir=cache_dir,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    local_files_only=local_files_only,
+                    token=token,
+                    revision=revision,
+                    subfolder=subfolder,
+                    _raise_exceptions_for_missing_entries=False,
+                    _raise_exceptions_for_connection_errors=False,
+                )
+                commit_hash = extract_commit_hash(resolved_config_file, commit_hash)
+            else:
+                commit_hash = getattr(config, "_commit_hash", None)
+
+        user_agent = {"file_type": "model", "framework": "mindspore", "from_auto_class": from_auto_class}
+        if from_pipeline is not None:
+            user_agent["using_pipeline"] = from_pipeline
+
+        if is_offline_mode() and not local_files_only:
+            logger.info("Offline mode: forcing local_files_only=True")
+            local_files_only = True
+
+        # Load config if we don't provide a configuration
+        if not isinstance(config, PretrainedConfig):
+            config_path = config if config is not None else pretrained_model_name_or_path
+            config, model_kwargs = cls.config_class.from_pretrained(
+                config_path,
+                cache_dir=cache_dir,
+                return_unused_kwargs=True,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                local_files_only=local_files_only,
+                token=token,
+                revision=revision,
+                subfolder=subfolder,
+                _from_auto=from_auto_class,
+                _from_pipeline=from_pipeline,
+                **kwargs,
+            )
+        else:
+            model_kwargs = kwargs
+
+        # This variable will flag if we're loading a sharded checkpoint. In this case the archive file is just the
+        # index of the files.
+        is_sharded = False
+        # sharded_metadata = None
+
+        if pretrained_model_name_or_path is not None:
+            pretrained_model_name_or_path = str(pretrained_model_name_or_path)
+            is_local = os.path.isdir(pretrained_model_name_or_path)
+            if is_local:
+                if os.path.isfile(
+                        os.path.join(pretrained_model_name_or_path, subfolder, \
+                                     _add_variant(WEIGHTS_NAME, variant))
+                ):
+                    # Load from a Mindspore checkpoint
+                    archive_file = os.path.join(
+                        pretrained_model_name_or_path, subfolder, \
+                        _add_variant(WEIGHTS_NAME, variant)
+                    )
+                elif os.path.isfile(
+                        os.path.join(pretrained_model_name_or_path, subfolder, \
+                                     _add_variant(WEIGHTS_INDEX_NAME, variant))
+                ):
+                    # Load from a sharded PyTorch checkpoint
+                    archive_file = os.path.join(
+                        pretrained_model_name_or_path, subfolder, \
+                        _add_variant(WEIGHTS_INDEX_NAME, variant)
+                    )
+                    is_sharded = True
+                else:
+                    raise EnvironmentError(
+                        f"Error no file named {_add_variant(WEIGHTS_NAME, variant)}"
+                        f" found in directory {pretrained_model_name_or_path}."
+                    )
+            elif os.path.isfile(os.path.join(subfolder, pretrained_model_name_or_path)):
+                archive_file = pretrained_model_name_or_path
+                is_local = True
+            elif is_remote_url(pretrained_model_name_or_path):
+                filename = pretrained_model_name_or_path
+                resolved_archive_file = download_url(pretrained_model_name_or_path)
+            else:
+                filename = _add_variant(WEIGHTS_NAME, variant)
+
+                try:
+                    # Load from URL or cache if already cached
+                    cached_file_kwargs = {
+                        "cache_dir": cache_dir,
+                        "force_download": force_download,
+                        "proxies": proxies,
+                        "resume_download": resume_download,
+                        "local_files_only": local_files_only,
+                        "token": token,
+                        "user_agent": user_agent,
+                        "revision": revision,
+                        "subfolder": subfolder,
+                        "_raise_exceptions_for_missing_entries": False,
+                        "_commit_hash": commit_hash,
+                    }
+                    resolved_archive_file = cached_file(pretrained_model_name_or_path, filename, **cached_file_kwargs)
+
+                    if resolved_archive_file is None and filename == _add_variant(WEIGHTS_NAME, variant):
+                        # Maybe the checkpoint is sharded, we try to grab the index name in this case.
+                        resolved_archive_file = cached_file(
+                            pretrained_model_name_or_path,
+                            _add_variant(WEIGHTS_INDEX_NAME, variant),
+                            **cached_file_kwargs,
+                        )
+                        if resolved_archive_file is not None:
+                            is_sharded = True
+                    if resolved_archive_file is None:
+                        # Otherwise, We try to give a helpful error message.
+                        has_file_kwargs = {
+                            "revision": revision,
+                            "proxies": proxies,
+                            "token": token,
+                        }
+                        if variant is not None and has_file(
+                                pretrained_model_name_or_path, WEIGHTS_NAME, **has_file_kwargs
+                        ):
+                            raise EnvironmentError(
+                                f"{pretrained_model_name_or_path} does not appear to have a file named"
+                                f" {_add_variant(WEIGHTS_NAME, variant)} but there is a file without the variant"
+                                f" {variant}. Use `variant=None` to load this model from those weights."
+                            )
+
+                        raise EnvironmentError(
+                            f"{pretrained_model_name_or_path} does not appear to have a file named"
+                            f" {_add_variant(WEIGHTS_NAME, variant)}."
+                        )
+                except EnvironmentError:
+                        # Raise any environment error raise by `cached_file`. It will have a helpful error message adapted
+                        # to the original exception.
+                    raise
+                except Exception:
+                    # For any other exception, we throw a generic error.
+                    raise EnvironmentError(
+                        f"Can't load the model for '{pretrained_model_name_or_path}'. If you were trying to load it"
+                        " from 'xxx', make sure you don't have a local directory with the"
+                        f" same name. Otherwise, make sure '{pretrained_model_name_or_path}' is the correct path to a"
+                        f" directory containing a file named {_add_variant(WEIGHTS_NAME, variant)}."
+                    )
+
+            if is_local:
+                logger.info(f"loading weights file {archive_file}")
+                resolved_archive_file = archive_file
+            else:
+                logger.info(f"loading weights file {filename} from cache at {resolved_archive_file}")
+        else:
+            resolved_archive_file = None
+
+        # We'll need to download and cache each checkpoint shard if the checkpoint is sharded.
+        if is_sharded:
+            # rsolved_archive_file becomes a list of files that point to the different checkpoint shards in this case.
+            resolved_archive_file, _ = get_checkpoint_shard_files(
+                pretrained_model_name_or_path,
+                resolved_archive_file,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                proxies=proxies,
+                resume_download=resume_download,
+                local_files_only=local_files_only,
+                token=token,
+                user_agent=user_agent,
+                revision=revision,
+                subfolder=subfolder,
+                _commit_hash=commit_hash,
+            )
+
+        config.name_or_path = pretrained_model_name_or_path
+
+        model = cls(config, *model_args, **model_kwargs)
+
+        # load params into net
+        (
+            model,
+            missing_keys,
+            unexpected_keys,
+            mismatched_keys
+        ) = cls._load_pretrained_model(
+            model,
+            state_dict,
+            resolved_archive_file,
+            pretrained_model_name_or_path,
+            ignore_mismatched_sizes
+        )
+
+        # make sure we use the model's config since the __init__ call might have copied it
+        config = model.config
+
+        # Set model in evaluation mode to deactivate DropOut modules by default
+        model.set_train(False)
+
+        # If it is a model with generation capabilities, attempt to load the generation config
+        if model.can_generate() and pretrained_model_name_or_path is not None:
+            model.generation_config = GenerationConfig.from_model_config(
+                config
+            )
+
+        if output_loading_info:
+            loading_info = {
+                "missing_keys": missing_keys,
+                "unexpected_keys": unexpected_keys,
+                "mismatched_keys": mismatched_keys,
+            }
+            return model, loading_info
+
+        return model
+
+
+    @classmethod
+    def _load_pretrained_model(
+            cls,
+            model,
+            state_dict,
+            resolved_archive_file,
+            pretrained_model_name_or_path,
+            ignore_mismatched_sizes=False
+    ):
+        """load pretrained model"""
+        model_state_dict = {}
+        for item in model.get_parameters():
+            model_state_dict[item.name] = item.data
+        expected_keys = list(model_state_dict.keys())
+
+        if state_dict is None:
+            if isinstance(resolved_archive_file, (list, tuple)):
+                state_dict = {}
+                for resolved_archive_file_ in resolved_archive_file:
+                    assert os.path.exists(resolved_archive_file_), f"{resolved_archive_file_} not found!"
+                    state_dict.update(load_checkpoint(resolved_archive_file_))
+            elif isinstance(resolved_archive_file, str):
+                assert os.path.exists(resolved_archive_file), f"{resolved_archive_file} not found!"
+                state_dict = load_checkpoint(resolved_archive_file)
+            else:
+                raise ValueError(f"`resolved_archive_file` should be str, list or tuple,"
+                                 f" but get {type(resolved_archive_file)}.")
+        loaded_keys = list(state_dict.keys())
+
+        prefix = model.base_model_prefix
+        if prefix:
+            has_prefix_module = any(s.startswith(prefix) for s in loaded_keys)
+            expects_prefix_module = any(s.startswith(prefix) for s in expected_keys)
+        else:
+            has_prefix_module = False
+            expects_prefix_module = False
+
+        # key re-naming operations are never done on the keys
+        # that are loaded, but always on the keys of the newly initialized model
+        remove_prefix_from_model = not has_prefix_module and expects_prefix_module
+        add_prefix_to_model = has_prefix_module and not expects_prefix_module
+
+        if remove_prefix_from_model:
+            prefix_ = f"{prefix}."
+            expected_keys = [s[len(prefix_) :] if s.startswith(prefix_) else s for s in expected_keys]
+        elif add_prefix_to_model:
+            expected_keys = [".".join([prefix, s]) for s in expected_keys]
+
+        def _find_mismatched_keys(
+                state_dict,
+                model_state_dict,
+                loaded_keys,
+                add_prefix_to_model,
+                remove_prefix_from_model,
+                ignore_mismatched_sizes,
+        ):
+            mismatched_keys = []
+            if ignore_mismatched_sizes:
+                for checkpoint_key in loaded_keys:
+                    if checkpoint_key not in state_dict:
+                        continue
+                    model_key = checkpoint_key
+                    if model_key not in model_state_dict:
+                        if remove_prefix_from_model:
+                            model_key = f"{prefix}.{checkpoint_key}"
+                        elif add_prefix_to_model:
+                            model_key = ".".join(checkpoint_key.split(".")[1:])
+
+                    if (
+                            model_key in model_state_dict
+                            and state_dict[checkpoint_key].shape != model_state_dict[model_key].shape
+                    ):
+                        mismatched_keys.append(
+                            (checkpoint_key, state_dict[checkpoint_key].shape, model_state_dict[model_key].shape)
+                        )
+                        del state_dict[checkpoint_key]
+            return mismatched_keys
+
+        mismatched_keys = _find_mismatched_keys(
+            state_dict,
+            model_state_dict,
+            loaded_keys,
+            add_prefix_to_model,
+            remove_prefix_from_model,
+            ignore_mismatched_sizes,
+        )
+        msgs = load_param_into_net(model, state_dict)
+        missing_keys, unexpected_keys = msgs
+
+        if unexpected_keys:
+            archs = [] if model.config.architectures is None else model.config.architectures
+            warner = logger.warning if model.__class__.__name__ in archs else logger.info
+            warner(
+                f"Some weights of the model checkpoint at {pretrained_model_name_or_path} were not used when"
+                f" initializing {model.__class__.__name__}: {unexpected_keys}\n- This IS expected if you are"
+                f" initializing {model.__class__.__name__} from the checkpoint of a model trained on another task or"
+                " with another architecture (e.g. initializing a BertForSequenceClassification model from a"
+                " BertForPreTraining model).\n- This IS NOT expected if you are initializing"
+                f" {model.__class__.__name__} from the checkpoint of a model that you expect to be exactly identical"
+                " (initializing a BertForSequenceClassification model from a BertForSequenceClassification model)."
+            )
+        else:
+            logger.info(f"All model checkpoint weights were used when initializing {model.__class__.__name__}.\n")
+        if missing_keys:
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized: {missing_keys}\nYou should probably"
+                " TRAIN this model on a down-stream task to be able to use it for predictions and inference."
+            )
+        else:
+            logger.info(
+                f"All the weights of {model.__class__.__name__} were initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path}.\nIf your task is similar to the task the model of the checkpoint"
+                f" was trained on, you can already use {model.__class__.__name__} for predictions without further"
+                " training."
+            )
+        if mismatched_keys:
+            mismatched_warning = "\n".join(
+                [
+                    f"- {key}: found shape {shape1} in the checkpoint and {shape2} in the model instantiated"
+                    for key, shape1, shape2 in mismatched_keys
+                ]
+            )
+            logger.warning(
+                f"Some weights of {model.__class__.__name__} were not initialized from the model checkpoint at"
+                f" {pretrained_model_name_or_path} and are newly initialized because the shapes did not"
+                f" match:\n{mismatched_warning}\nYou should probably TRAIN this model on a down-stream task to be able"
+                " to use it for predictions and inference."
+            )
+
+        return model, missing_keys, unexpected_keys, mismatched_keys
+
+    @classmethod
+    def register_for_auto_class(cls, auto_class="AutoModel"):
+        """
+        Register this class with a given auto class. This should only be used for custom models as the ones in the
+        library are already mapped with an auto class.
+
+        <Tip warning={true}>
+
+        This API is experimental and may have some slight breaking changes in the next releases.
+
+        </Tip>
+
+        Args:
+            auto_class (`str` or `type`, *optional*, defaults to `"AutoModel"`):
+                The auto class to register this new model with.
+        """
+        if not isinstance(auto_class, str):
+            auto_class = auto_class.__name__
+
+        import mindformers.models.auto as auto_module
+
+        if not hasattr(auto_module, auto_class):
+            raise ValueError(f"{auto_class} is not a valid auto class.")
+
+        cls._auto_class = auto_class
+ 

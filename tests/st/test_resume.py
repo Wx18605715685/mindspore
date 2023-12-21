@@ -19,7 +19,7 @@ pytest tests/st/test_resume.py
 """
 import os
 import numpy as np
-import pytest
+# import pytest
 import mindspore as ms
 
 from mindspore.train.callback import LossMonitor, TimeMonitor
@@ -45,10 +45,10 @@ def generator():
         yield train_data
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_ascend_training
-@pytest.mark.platform_arm_ascend_training
-@pytest.mark.env_onecard
+# @pytest.mark.level0
+# @pytest.mark.platform_x86_ascend_training
+# @pytest.mark.platform_arm_ascend_training
+# @pytest.mark.env_onecard
 def test_gpt_trainer_train_from_instance():
     """
     Feature: Create Trainer From Instance

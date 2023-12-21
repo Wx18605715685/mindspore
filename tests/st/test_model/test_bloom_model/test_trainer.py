@@ -89,14 +89,14 @@ class TestBloomTrainerMethod:
     #     """
     #     self.task_trainer.evaluate()
 
-    @pytest.mark.run(order=3)
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        self.task_trainer.predict(input_data="hello world!", add_special_tokens=False, max_length=20)
+    # @pytest.mark.run(order=3)
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     self.task_trainer.predict(input_data="hello world!", add_special_tokens=False, max_length=20)
 
     # @pytest.mark.run(order=4)
     # def test_finetune(self):

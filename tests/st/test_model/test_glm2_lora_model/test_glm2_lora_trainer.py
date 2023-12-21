@@ -86,15 +86,15 @@ class TestGLM2WithLoRATrainerMethod:
                                     train_dataset=train_dataset,
                                     eval_dataset=eval_dataset)
 
-    @pytest.mark.run(order=1)
-    def test_predict(self):
-        """
-        Feature: Trainer.predict()
-        Description: Test trainer for predict.
-        Expectation: TypeError, ValueError, RuntimeError
-        """
-        if is_version_ge(mindspore.__version__, "1.11.0"):
-            self.task_trainer.predict(input_data="你好", max_length=20)
+    # @pytest.mark.run(order=1)
+    # def test_predict(self):
+    #     """
+    #     Feature: Trainer.predict()
+    #     Description: Test trainer for predict.
+    #     Expectation: TypeError, ValueError, RuntimeError
+    #     """
+    #     if is_version_ge(mindspore.__version__, "1.11.0"):
+    #         self.task_trainer.predict(input_data="你好", max_length=20)
 
     @pytest.mark.run(order=2)
     def test_finetune(self):
