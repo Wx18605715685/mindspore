@@ -24,7 +24,8 @@ from mindspore.dataset.vision import Inter
 from mindspore.ops import operations as P
 
 from mindformers.mindformer_book import MindFormerBook
-from mindformers.models.base_processor import BaseProcessor, BaseImageProcessor
+from mindformers.models.base_processor import BaseProcessor
+from mindformers.models.image_processing_utils import BaseImageProcessor
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
