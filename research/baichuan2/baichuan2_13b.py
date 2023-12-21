@@ -1088,7 +1088,7 @@ class NormHead(nn.Cell):
         self.weight = Parameter(
             initializer(HeUniform(negative_slope=math.sqrt(5)),
                         [vocab_size, hidden_size],
-                        mstype.float32),
+                        mstype.float16),
             name='weight',
             parallel_optimizer=False)
         self.square = P.Square()
@@ -1097,7 +1097,7 @@ class NormHead(nn.Cell):
         self.real_div = P.RealDiv()
         self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.sum = P.ReduceSum()
-        self.eps = Tensor([eps], mstype.float32)
+        self.eps = Tensor([eps], mstype.float16)
 
         self.matmul = P.MatMul(transpose_b=True)
         self.cast = P.Cast()

@@ -163,6 +163,7 @@ model:
     use_causal_attention: True
     max_cache_length: 26624
     use_kvcache_mgr: True
+    is_sample_acceleration: True
     offset: 0
     use_past_shard: False
     checkpoint_name_or_path: "path/to/Baichuan2-13B-Chat.ckpt"
