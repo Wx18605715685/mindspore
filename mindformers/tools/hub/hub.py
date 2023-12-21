@@ -279,7 +279,7 @@ def cached_file(
 
     return resolved_file
 
-def download_url(url):
+def download_url(url, proxies=None):
     raise NotImplementedError()
 
 def extract_commit_hash(resolved_file: Optional[str], commit_hash: Optional[str]) -> Optional[str]:

@@ -12,22 +12,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ============================================================================
-"""GPT2 Tokenizer"""
+"""Tokenization classes for OpenAI GPT."""
+
+
 import json
-from functools import lru_cache
-from typing import List, Optional
 import os
+from functools import lru_cache
+from typing import List, Optional, Tuple
+
 import regex as re
+from ..tokenization_utils import AddedToken, PreTrainedTokenizer
+from ...tools import logger
 
-from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from mindformers.models.base_tokenizer import Tokenizer, AddedToken
-from mindformers.tools import logger
-from ...mindformer_book import MindFormerBook
 
-__all__ = ['GPT2Tokenizer']
+VOCAB_FILES_NAMES = {
+    "vocab_file": "vocab.json",
+    "merges_file": "merges.txt",
+}
 
-@lru_cache()
+PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES = {
+    "gpt2": 1024,
+    "gpt2-medium": 1024,
+    "gpt2-large": 1024,
+    "gpt2-xl": 1024,
+    "distilgpt2": 1024,
+}
+
+
+@lru_cache(128)
 def bytes_to_unicode():
     """
     Returns list of utf-8 byte and a mapping to unicode strings. We specifically avoids mapping to whitespace/control
@@ -66,14 +78,7 @@ def get_pairs(word):
     return pairs
 
 
-VOCAB_FILES_NAMES = {
-    "vocab_file": "vocab.json",
-    "merges_file": "merges.txt",
-}
-
-
-@MindFormerRegister.register(MindFormerModuleType.TOKENIZER)
-class GPT2Tokenizer(Tokenizer):
+class GPT2Tokenizer(PreTrainedTokenizer):
     """
     Construct a GPT-2 tokenizer. Based on byte-level Byte-Pair-Encoding.
 
@@ -81,13 +86,13 @@ class GPT2Tokenizer(Tokenizer):
     be encoded differently whether it is at the beginning of the sentence (without space) or not:
 
     ```python
-    >>> from mindformers import GPT2Tokenizer
+    >>> from transformers import GPT2Tokenizer
 
     >>> tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    >>> tokenizer("Hello world", add_bos_token=False, add_eos_token=False)["input_ids"]
+    >>> tokenizer("Hello world")["input_ids"]
     [15496, 995]
 
-    >>> tokenizer(" Hello world", add_bos_token=False, add_eos_token=False)["input_ids"]
+    >>> tokenizer(" Hello world")["input_ids"]
     [18435, 995]
     ```
 
@@ -111,38 +116,26 @@ class GPT2Tokenizer(Tokenizer):
         errors (`str`, *optional*, defaults to `"replace"`):
             Paradigm to follow when decoding bytes to UTF-8. See
             [bytes.decode](https://docs.python.org/3/library/stdtypes.html#bytes.decode) for more information.
-        unk_token (`str`, *optional*, defaults to `<|endoftext|>`):
+        unk_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
             The unknown token. A token that is not in the vocabulary cannot be converted to an ID and is set to be this
             token instead.
-        bos_token (`str`, *optional*, defaults to `<|endoftext|>`):
+        bos_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
             The beginning of sequence token.
-        eos_token (`str`, *optional*, defaults to `<|endoftext|>`):
+        eos_token (`str`, *optional*, defaults to `"<|endoftext|>"`):
             The end of sequence token.
+        pad_token (`str`, *optional*):
+            The token used for padding, for example when batching sequences of different lengths.
         add_prefix_space (`bool`, *optional*, defaults to `False`):
             Whether or not to add an initial space to the input. This allows to treat the leading word just as any
             other word. (GPT2 tokenizer detect beginning of words by the preceding space).
-        add_bos_token(`bool`, *optional*, defaults to `True`):
-            Whether or not to add the bos_token_id to the left of the input.
-        add_eos_token(`bool`, *optional*, defaults to `True`):
-            Whether or not to add the eos_token_id to the right of the input.
-
-    Examples:
-        >>> from mindformers import GPT2Tokenizer
-
-        >>> tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        >>> res = tokenizer("Hello world")
-        >>> print(res)
-        {'input_ids': [15496, 995], 'token_type_ids': [0, 0], 'attention_mask': [1, 1]}
-
-    Outputs:
-        A dict contains the processed ids, attention_mask that specific by the member `MODEL_INPUT_NAME`
-        of the subclass.
+        add_bos_token (`bool`, *optional*, defaults to `False`):
+            Whether or not to add an initial beginning of sentence token to the input. This allows to treat the leading
+            word just as any other word.
     """
 
     vocab_files_names = VOCAB_FILES_NAMES
-    model_input_names = ["input_ids", "token_type_ids", "attention_mask"]
-    FILE_LIST = ['tokenizer_config.json']
-    _support_list = MindFormerBook.get_tokenizer_support_list()['gpt2']
+    max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
+    model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(
             self,
@@ -152,27 +145,17 @@ class GPT2Tokenizer(Tokenizer):
             unk_token="<|endoftext|>",
             bos_token="<|endoftext|>",
             eos_token="<|endoftext|>",
-            pad_token="<|endoftext|>",
+            pad_token=None,
             add_prefix_space=False,
             add_bos_token=False,
-            add_eos_token=False,
             **kwargs,
     ):
         bos_token = AddedToken(bos_token, lstrip=False, rstrip=False) if isinstance(bos_token, str) else bos_token
         eos_token = AddedToken(eos_token, lstrip=False, rstrip=False) if isinstance(eos_token, str) else eos_token
         unk_token = AddedToken(unk_token, lstrip=False, rstrip=False) if isinstance(unk_token, str) else unk_token
         pad_token = AddedToken(pad_token, lstrip=False, rstrip=False) if isinstance(pad_token, str) else pad_token
-        super().__init__(
-            errors=errors,
-            unk_token=unk_token,
-            bos_token=bos_token,
-            eos_token=eos_token,
-            pad_token=pad_token,
-            add_prefix_space=add_prefix_space,
-            **kwargs,
-        )
+
         self.add_bos_token = add_bos_token
-        self.add_eos_token = add_eos_token
 
         with open(vocab_file, encoding="utf-8") as vocab_handle:
             self.encoder = json.load(vocab_handle)
@@ -190,6 +173,17 @@ class GPT2Tokenizer(Tokenizer):
         # Should have added re.IGNORECASE so BPE merges can happen for capitalized versions of contractions
         self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
+        super().__init__(
+            errors=errors,
+            unk_token=unk_token,
+            bos_token=bos_token,
+            eos_token=eos_token,
+            pad_token=pad_token,
+            add_prefix_space=add_prefix_space,
+            add_bos_token=add_bos_token,
+            **kwargs,
+        )
+
     @property
     def vocab_size(self):
         return len(self.encoder)
@@ -198,7 +192,7 @@ class GPT2Tokenizer(Tokenizer):
         return dict(self.encoder, **self.added_tokens_encoder)
 
     def bpe(self, token):
-        """bpe encode """
+        """bpe"""
         if token in self.cache:
             return self.cache[token]
         word = tuple(token)
@@ -241,16 +235,17 @@ class GPT2Tokenizer(Tokenizer):
         return word
 
     def build_inputs_with_special_tokens(self, token_ids_0, token_ids_1=None):
-        """Insert the special tokens to the input_ids. Currently"""
-        bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-        eos_token_id = [self.eos_token_id] if self.add_eos_token else []
+        if self.add_bos_token:
+            bos_token_ids = [self.bos_token_id]
+        else:
+            bos_token_ids = []
 
-        output = bos_token_id + token_ids_0 + eos_token_id
+        output = bos_token_ids + token_ids_0
 
-        if token_ids_1 is not None:
-            output = output + bos_token_id + token_ids_1 + eos_token_id
+        if token_ids_1 is None:
+            return output
 
-        return output
+        return output + bos_token_ids + token_ids_1
 
     def get_special_tokens_mask(
             self,
@@ -311,10 +306,9 @@ class GPT2Tokenizer(Tokenizer):
         text = bytearray([self.byte_decoder[c] for c in text]).decode("utf-8", errors=self.errors)
         return text
 
-    def save_vocabulary(self, save_directory, filename_prefix=None):
-        """write the word to the files"""
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
         if not os.path.isdir(save_directory):
-            logger.error("Vocabulary path (%s) should be a directory", save_directory)
+            logger.error(f"Vocabulary path ({save_directory}) should be a directory")
             return None
         vocab_file = os.path.join(
             save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
@@ -324,9 +318,7 @@ class GPT2Tokenizer(Tokenizer):
         )
 
         with open(vocab_file, "w", encoding="utf-8") as f:
-            # you can set sort_keys=True, then the keys of vocabulary dict is sorted,
-            # which is different from original vocabulary file.
-            f.write(json.dumps(self.encoder, indent=2, ensure_ascii=False) + "\n")
+            f.write(json.dumps(self.encoder, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
         index = 0
         with open(merge_file, "w", encoding="utf-8") as writer:
@@ -334,8 +326,8 @@ class GPT2Tokenizer(Tokenizer):
             for bpe_tokens, token_index in sorted(self.bpe_ranks.items(), key=lambda kv: kv[1]):
                 if index != token_index:
                     logger.warning(
-                        "Saving vocabulary to %s: BPE merge indices are not consecutive."
-                        " Please check that the tokenizer is not corrupted!", merge_file
+                        f"Saving vocabulary to {merge_file}: BPE merge indices are not consecutive."
+                        " Please check that the tokenizer is not corrupted!"
                     )
                     index = token_index
                 writer.write(" ".join(bpe_tokens) + "\n")
@@ -344,41 +336,21 @@ class GPT2Tokenizer(Tokenizer):
         return vocab_file, merge_file
 
     def prepare_for_tokenization(self, text, **kwargs):
-        add_prefix_space = kwargs.pop("add_prefix_space", self.add_prefix_space)
         is_split_into_words = kwargs.pop("is_split_into_words", False)
+        add_prefix_space = kwargs.pop("add_prefix_space", self.add_prefix_space)
         if is_split_into_words or add_prefix_space:
             text = " " + text
         return (text, kwargs)
 
-    def create_token_type_ids_from_sequences(
-            self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None
-    ) -> List[int]:
+    @property
+    def default_chat_template(self):
         """
-        Creates a mask from the two sequences passed to be used in a sequence-pair classification task. An ALBERT
-        sequence pair mask has the following format:
-
-        ```
-        0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1
-        | first sequence    | second sequence |
-        ```
-
-        if token_ids_1 is None, only returns the first portion of the mask (0s).
-
-        Args:
-            token_ids_0 (`List[int]`):
-                List of ids.
-            token_ids_1 (`List[int]`, *optional*):
-                Optional second list of IDs for sequence pairs.
-
-        Returns:
-            `List[int]`: List of [token type IDs](../glossary#token-type-ids) according to the given sequence(s).
+        A simple chat template that ignores role information and just concatenates messages with EOS tokens.
         """
-        bos_token_id = [self.bos_token_id] if self.add_bos_token else []
-        eos_token_id = [self.eos_token_id] if self.add_eos_token else []
-
-        output = [0] * len(bos_token_id + token_ids_0 + eos_token_id)
-
-        if token_ids_1 is not None:
-            output += [1] * len(bos_token_id + token_ids_1 + eos_token_id)
-
-        return output
+        logger.warning(
+            "\nNo chat template is defined for this tokenizer - using the default template "
+            f"for the {self.__class__.__name__} class. If the default is not appropriate for "
+            "your model, please set `tokenizer.chat_template` to an appropriate template. "
+            "See https://huggingface.co/docs/transformers/main/chat_templating for more information.\n"
+        )
+        return "{% for message in messages %}" "{{ message.content }}{{ eos_token }}" "{% endfor %}"

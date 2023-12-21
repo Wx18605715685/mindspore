@@ -1,1 +1,3 @@
 mindformers/mindformers/models/auto/configuration_auto.py:from_pretrained
+mindformers/mindformers/models/auto/tokenization_auto.py:from_pretrained
+mindformers/mindformers/models/tokenization_utils.py:split

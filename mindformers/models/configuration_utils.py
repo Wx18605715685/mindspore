@@ -86,6 +86,7 @@ class PretrainedConfig(PushToHubMixin):
 
         # version info
         self.mindformers_version = kwargs.pop("mindformers_version", None)
+        self.tokenizer_class = kwargs.pop("tokenizer_class", None)
 
         for key, value in kwargs.items():
             try:
