@@ -19,7 +19,7 @@ import numpy as np
 from PIL import Image
 
 from mindspore import Tensor
-from mindspore.dataset.vision import CenterCrop, ToTensor, Normalize, Rescale
+from mindspore.dataset.vision import CenterCrop, ToTensor, Normalize
 
 from mindformers.mindformer_book import MindFormerBook
 from mindformers.dataset import Resize
@@ -44,13 +44,21 @@ class ViTImageProcessor(BaseImageProcessor):
         <class 'mindformers.models.vit.vit_processor.ViTImageProcessor'>
     """
 
-    def __init__(self, size=224):
-        super().__init__(image_resolution=size)
-        self.resize = Resize(256, interpolation='cubic')
-        self.center_crop = CenterCrop(size)
-        self.to_tensor = ToTensor()
-        self.rescale = Rescale(1.0 / 255.0, 0.0)
-        self.normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], is_hwc=False)
+    def __init__(self,
+                 size=224,
+                 resize=256,
+                 mean=(0.485, 0.456, 0.406),
+                 std=(0.229, 0.224, 0.225),
+                 is_hwc=False,
+                 interpolation='cubic',
+                 **kwargs):
+        super().__init__()
+        self.size = size
+        self.resize = resize
+        self.mean = mean
+        self.std = std
+        self.is_hwc = is_hwc
+        self.interpolation = interpolation
 
     def preprocess(self, images, **kwargs):
         """
@@ -62,14 +70,19 @@ class ViTImageProcessor(BaseImageProcessor):
         Return:
             A 4-rank tensor for a batch of images.
         """
+        resize = Resize(self.resize, interpolation=self.interpolation)
+        center_crop = CenterCrop(self.size)
+        to_tensor = ToTensor()
+        normalize = Normalize(mean=self.mean, std=self.std, is_hwc=self.is_hwc)
+
         images = self._format_inputs(images)
 
         res = []
         for image in images:
-            image = self.resize(image)
-            image = self.center_crop(image)
-            image = self.to_tensor(image)
-            image = self.normalize(image)
+            image = resize(image)
+            image = center_crop(image)
+            image = to_tensor(image)
+            image = normalize(image)
             res.append(image)
         return Tensor(res)
 
