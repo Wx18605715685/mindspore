@@ -8,7 +8,7 @@ mindformers.pipeline
     :nosignatures:
     :template: classtemplate.rst
 
-    mindformers.pipeline.BasePipeline
+    mindformers.pipeline.Pipeline
     mindformers.pipeline.pipeline
     mindformers.pipeline.FillMaskPipeline
     mindformers.pipeline.TranslationPipeline
