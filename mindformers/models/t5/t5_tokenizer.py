@@ -28,6 +28,8 @@ from ..tokenization_utils import PreTrainedTokenizer
 from ..tokenization_utils_base import AddedToken
 from ..bert import BertTokenizer
 from ...tools import logger
+from ...mindformer_book import MindFormerBook
+from ...tools.register import MindFormerRegister, MindFormerModuleType
 
 
 if TYPE_CHECKING:
@@ -49,6 +51,7 @@ PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES = {
 SPIECE_UNDERLINE = "▁"
 
 
+@MindFormerRegister.register(MindFormerModuleType.TOKENIZER)
 class T5Tokenizer(PreTrainedTokenizer):
     """
         Construct a T5 tokenizer. Based on [SentencePiece](https://github.com/google/sentencepiece).
@@ -128,6 +131,7 @@ class T5Tokenizer(PreTrainedTokenizer):
     vocab_files_names = VOCAB_FILES_NAMES
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
     model_input_names = ["input_ids", "attention_mask"]
+    _support_list = MindFormerBook.get_tokenizer_support_list()['t5']
 
     def __init__(
             self,

@@ -23,6 +23,8 @@ from typing import List, Optional, Tuple
 import regex as re
 from ..tokenization_utils import AddedToken, PreTrainedTokenizer, _is_control, _is_punctuation, _is_whitespace
 from ...tools import logger
+from ...mindformer_book import MindFormerBook
+from ...tools.register import MindFormerRegister, MindFormerModuleType
 
 
 VOCAB_FILES_NAMES = {
@@ -258,6 +260,7 @@ class BasicTokenizer:
         return "".join(output)
 
 
+@MindFormerRegister.register(MindFormerModuleType.TOKENIZER)
 class CLIPTokenizer(PreTrainedTokenizer):
     """
     Construct a CLIP tokenizer. Based on byte-level Byte-Pair-Encoding.
@@ -287,6 +290,7 @@ class CLIPTokenizer(PreTrainedTokenizer):
     vocab_files_names = VOCAB_FILES_NAMES
     max_model_input_sizes = PRETRAINED_POSITIONAL_EMBEDDINGS_SIZES
     model_input_names = ["input_ids", "attention_mask"]
+    _support_list = MindFormerBook.get_tokenizer_support_list()['clip']
 
     def __init__(
             self,
