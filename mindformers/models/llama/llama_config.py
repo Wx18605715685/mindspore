@@ -13,20 +13,18 @@
 # limitations under the License.
 # ============================================================================
 """Llama Config API."""
-
-
-from typing import Optional
+from typing import Optional, Union
+from mindspore._checkparam import args_type_check
 from mindformers.modules.transformer.transformer import default_transformer_config, TransformerOpParallelConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from ..utils import convert_mstype
-from ..base_config import BaseConfig
-from ...mindformer_book import MindFormerBook
+from ..configuration_utils import PretrainedConfig
 
 __all__ = ['LlamaConfig']
 
 
 @MindFormerRegister.register(MindFormerModuleType.CONFIG)
-class LlamaConfig(BaseConfig):
+class LlamaConfig(PretrainedConfig):
     """
     LLaMA config class which defines the model size.
 
@@ -91,8 +89,9 @@ class LlamaConfig(BaseConfig):
             Class, LlamaConfig.
     """
 
-    _support_list = MindFormerBook.get_config_support_list()['llama']
+    model_type = 'llama'
 
+    @args_type_check(parallel_config=(dict, TransformerOpParallelConfig))
     def __init__(self,
                  batch_size: int = 1,
                  seq_length: int = 2048,
@@ -114,7 +113,7 @@ class LlamaConfig(BaseConfig):
                  softmax_compute_type: str = "float32",
                  rotary_dtype: str = "float32",
                  param_init_type: str = "float16",
-                 parallel_config: TransformerOpParallelConfig = default_transformer_config,
+                 parallel_config: Union[dict, TransformerOpParallelConfig] = default_transformer_config,
                  use_past: bool = False,
                  pretrain_seqlen: int = 2048,
                  extend_method: str = "None",
@@ -123,13 +122,12 @@ class LlamaConfig(BaseConfig):
                  offset: int = 0,
                  use_past_shard: bool = False,
                  checkpoint_name_or_path: str = "",
-                 repetition_penalty: float = 1.0,
-                 max_decode_length: int = 1024,
+                 max_length: int = 1024,
                  top_k: int = 5,
-                 top_p: float = 1.0,
                  do_sample: bool = True,
                  **kwargs):
-        super(LlamaConfig, self).__init__(**kwargs)
+        if isinstance(parallel_config, dict):
+            parallel_config = TransformerOpParallelConfig(**parallel_config)
         self.batch_size = batch_size
         self.seq_length = seq_length
         self.vocab_size = vocab_size
@@ -147,9 +145,6 @@ class LlamaConfig(BaseConfig):
         self.compute_dtype = convert_mstype(compute_dtype)
         self.parallel_config = parallel_config
         self.checkpoint_name_or_path = checkpoint_name_or_path
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.pad_token_id = pad_token_id
         self.ignore_token_id = ignore_token_id
         self.use_past = use_past
         self.pretrain_seqlen = pretrain_seqlen
@@ -157,10 +152,24 @@ class LlamaConfig(BaseConfig):
         self.compute_in_2d = compute_in_2d
         self.use_flash_attention = use_flash_attention
         self.offset = offset
-        self.use_past_shard = use_past_shard
-        self.repetition_penalty = repetition_penalty
-        self.max_decode_length = max_decode_length
-        self.top_k = top_k
-        self.top_p = top_p
-        self.do_sample = do_sample
         self.theta = theta
+
+        # generation_config
+        self.use_past_shard = use_past_shard
+        self.max_length = max_length
+        self.top_k = top_k
+        self.do_sample = do_sample
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+
+        super(LlamaConfig, self).__init__(
+            batch_size=batch_size,
+            max_length=max_length,
+            top_k=top_k,
+            do_sample=do_sample,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            **kwargs,
+        )
