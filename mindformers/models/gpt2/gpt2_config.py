@@ -126,10 +126,8 @@ class GPT2Config(PretrainedConfig):
                  parallel_config: Union[dict, TransformerOpParallelConfig] = default_transformer_config,
                  checkpoint_name_or_path: str = "",
                  moe_config: Union[dict, MoEConfig] = default_moe_config,
-                 repetition_penalty: float = 1.0,
-                 max_decode_length: int = 1024,
+                 max_length: int = 1024,
                  top_k: int = 5,
-                 top_p: float = 1.0,
                  do_sample: bool = True,
                  **kwargs):
         super(GPT2Config, self).__init__(**kwargs)
@@ -138,9 +136,6 @@ class GPT2Config(PretrainedConfig):
         if isinstance(moe_config, dict):
             moe_config = MoEConfig(**moe_config)
         self.batch_size = batch_size
-        self.eos_token_id = eos_token_id
-        self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
         self.unk_token_id = unk_token_id
         self.seq_length = seq_length
         self.vocab_size = vocab_size
@@ -163,8 +158,22 @@ class GPT2Config(PretrainedConfig):
         self.parallel_config = parallel_config
         self.checkpoint_name_or_path = checkpoint_name_or_path
         self.moe_config = moe_config
-        self.repetition_penalty = repetition_penalty
-        self.max_decode_length = max_decode_length
+
+        # generation_config
+        self.max_length = max_length
         self.top_k = top_k
-        self.top_p = top_p
         self.do_sample = do_sample
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+
+        super(GPT2Config, self).__init__(
+            batch_size=batch_size,
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            max_length=max_length,
+            top_k=top_k,
+            do_sample=do_sample,
+            **kwargs
+        )
