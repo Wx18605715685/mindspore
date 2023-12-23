@@ -88,6 +88,33 @@ class PretrainedConfig(PushToHubMixin):
         self.mindformers_version = kwargs.pop("mindformers_version", None)
         self.tokenizer_class = kwargs.pop("tokenizer_class", None)
 
+        # general config
+        self.batch_size = kwargs.pop("batch_size", 1)
+        self.is_encoder_decoder = kwargs.pop("is_encoder_decoder", None)
+
+        # generation config
+        # max generate length
+        self.max_length = kwargs.pop("max_length", 20)
+        self.max_new_tokens = kwargs.pop("max_new_tokens", None)
+        # number of beams
+        self.num_beams = kwargs.pop("num_beams", 1)
+        # do sample or not
+        self.do_sample = kwargs.pop("do_sample", False)
+        # incremental infer
+        self.use_past = kwargs.pop("use_past", False)
+        self.is_sample_acceleration = kwargs.pop("is_sample_acceleration", False)
+        # logits processors
+        self.temperature = kwargs.pop("temperature", 1.0)
+        self.top_k = kwargs.pop("top_k", 50)
+        self.top_p = kwargs.pop("top_p", 1.0)
+        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
+        self.encoder_repetition_penalty = kwargs.pop("encoder_repetition_penalty", 1.0)
+        self.renormalize_logits = kwargs.pop("renormalize_logits", False)
+        # Special tokens that can be used at generation time
+        self.pad_token_id = kwargs.pop("pad_token_id", None)
+        self.bos_token_id = kwargs.pop("bos_token_id", None)
+        self.eos_token_id = kwargs.pop("eos_token_id", None)
+
         for key, value in kwargs.items():
             try:
                 setattr(self, key, value)
