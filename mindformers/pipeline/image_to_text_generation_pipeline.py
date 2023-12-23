@@ -26,11 +26,11 @@ from mindformers.tools.image_tools import load_image
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 from .base_pipeline import Pipeline
 
-__all__ = ['ImageToTextGenerationPipeline']
+__all__ = ['ImageToTextPipeline']
 
 
 @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="image_to_text_generation")
-class ImageToTextGenerationPipeline(Pipeline):
+class ImageToTextPipeline(Pipeline):
     r"""Pipeline for image to text generation
 
     Args:
@@ -53,7 +53,7 @@ class ImageToTextGenerationPipeline(Pipeline):
                  **kwargs):
 
         if image_processor is None:
-            raise ValueError("ImageToTextGenerationPipeline"
+            raise ValueError("ImageToTextPipeline"
                              " requires for a image_processor.")
         self.hypothesis_template = kwargs.pop("hypothesis_template", "{}")
         super().__init__(model, image_processor=image_processor, tokenizer=tokenizer, **kwargs)

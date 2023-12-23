@@ -15,19 +15,28 @@
 
 """Constant Declaration of Pipeline Registry"""
 from mindformers.auto_class import AutoModel
-from .image_classification_pipeline import ImageClassificationPipeline
-from .zero_shot_image_classification_pipeline import ZeroShotImageClassificationPipeline
-from .image_to_text_generation_pipeline import ImageToTextGenerationPipeline
-from .translation_pipeline import TranslationPipeline
-from .fill_mask_pipeline import FillMaskPipeline
-from .text_classification_pipeline import TextClassificationPipeline
-from .token_classification_pipeline import TokenClassificationPipeline
-from .question_answering_pipeline import QuestionAnsweringPipeline
-from .text_generation_pipeline import TextGenerationPipeline
-from .masked_image_modeling_pipeline import MaskedImageModelingPipeline
-from .segment_anything_pipeline import SegmentAnythingPipeline
-from .pipeline_registry import PipelineRegistry
+from mindformers.models.auto.modeling_auto import (
+    AutoModelForCausalLM,
+    AutoModelForImageClassification,
+    AutoModelForQuestionAnswering,
+    AutoModelForSeq2SeqLM,
+    AutoModelForTokenClassification,
+    AutoModelForVision2Seq,
+    AutoModelForZeroShotImageClassification)
 
+from .fill_mask_pipeline import FillMaskPipeline
+from .image_classification_pipeline import ImageClassificationPipeline
+from .image_to_text_generation_pipeline import ImageToTextPipeline
+from .masked_image_modeling_pipeline import MaskedImageModelingPipeline
+from .pipeline_registry import PipelineRegistry
+from .question_answering_pipeline import QuestionAnsweringPipeline
+from .segment_anything_pipeline import SegmentAnythingPipeline
+from .text_classification_pipeline import TextClassificationPipeline
+from .text_generation_pipeline import TextGenerationPipeline
+from .token_classification_pipeline import TokenClassificationPipeline
+from .translation_pipeline import TranslationPipeline
+from .zero_shot_image_classification_pipeline import \
+    ZeroShotImageClassificationPipeline
 
 TASK_ALIASES = {
     "text_classification": "text-classification",
@@ -35,7 +44,7 @@ TASK_ALIASES = {
     "ner": "token-classification",
     "fill_mask": "fill-mask",
     "image_classification": "image-classification",
-    "image_to_text_generation": "image-to-text-generation",
+    "image_to_text_generation": "image-to-text",
     "masked_image_modeling": "masked-image-modeling",
     "question_answering": "question-answering",
     "segment_anything": "segment-anything",
@@ -44,6 +53,7 @@ TASK_ALIASES = {
     "zero_shot_image_classification": "zero-shot-image-classification",
 }
 
+# TODO: default model repo need to be filled.
 SUPPORTED_TASKS = {
     "fill-mask": {
         "impl": FillMaskPipeline,
@@ -53,16 +63,17 @@ SUPPORTED_TASKS = {
     },
     "image-classification": {
         "impl": ImageClassificationPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForImageClassification,),
         "default": {"model": {"ms": ()}},
         "type": "image",
     },
-    "image-to-text-generation": {
-        "impl": ImageToTextGenerationPipeline,
-        "ms": (AutoModel,),
+    "image-to-text": {
+        "impl": ImageToTextPipeline,
+        "ms": (AutoModelForVision2Seq,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "multimodal",
     },
+    # TODO: define model type
     "masked-image-modeling": {
         "impl": MaskedImageModelingPipeline,
         "ms": (AutoModel,),
@@ -71,46 +82,69 @@ SUPPORTED_TASKS = {
     },
     "question-answering": {
         "impl": QuestionAnsweringPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForQuestionAnswering,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "text",
     },
+    # TODO: define model type
     "segment-anything": {
         "impl": SegmentAnythingPipeline,
         "ms": (AutoModel,),
         "default": {"model": {"ms": ()}},
         "type": "image",
     },
+    # TODO: AutoModelForSequenceClassification
     "text-classification": {
         "impl": TextClassificationPipeline,
         "ms": (AutoModel,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "text",
     },
     "text-generation": {
         "impl": TextGenerationPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForCausalLM,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "text",
     },
     "token-classification": {
         "impl": TokenClassificationPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForTokenClassification,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "text",
     },
     "translation": {
         "impl": TranslationPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForSeq2SeqLM,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "text",
     },
     "zero-shot-image-classification": {
         "impl": ZeroShotImageClassificationPipeline,
-        "ms": (AutoModel,),
+        "ms": (AutoModelForZeroShotImageClassification,),
         "default": {"model": {"ms": ()}},
-        "type": "image",
+        "type": "multimodal",
     },
 }
+
+NO_FEATURE_EXTRACTOR_TASKS = set()
+NO_IMAGE_PROCESSOR_TASKS = set()
+NO_TOKENIZER_TASKS = set()
+# Those model configs are special, they are generic over their task, meaning
+# any tokenizer/feature_extractor might be use for a given model so we cannot
+# use the statically defined TOKENIZER_MAPPING and FEATURE_EXTRACTOR_MAPPING to
+# see if the model defines such objects or not.
+# reserved multi-modal configs
+MULTI_MODEL_CONFIGS = {}
+for task, values in SUPPORTED_TASKS.items():
+    if values["type"] == "text":
+        NO_FEATURE_EXTRACTOR_TASKS.add(task)
+        NO_IMAGE_PROCESSOR_TASKS.add(task)
+    elif values["type"] in {"image", "video"}:
+        NO_TOKENIZER_TASKS.add(task)
+    elif values["type"] in {"audio"}:
+        NO_TOKENIZER_TASKS.add(task)
+        NO_IMAGE_PROCESSOR_TASKS.add(task)
+    elif values["type"] != "multimodal":
+        raise ValueError(f"SUPPORTED_TASK {task} contains invalid type {values['type']}")
 
 PIPELINE_REGISTRY = PipelineRegistry(supported_tasks=SUPPORTED_TASKS, task_aliases=TASK_ALIASES)

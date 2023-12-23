@@ -18,7 +18,7 @@ from .build_pipeline import build_pipeline
 from .base_pipeline import Pipeline
 from .image_classification_pipeline import ImageClassificationPipeline
 from .zero_shot_image_classification_pipeline import ZeroShotImageClassificationPipeline
-from .image_to_text_generation_pipeline import ImageToTextGenerationPipeline
+from .image_to_text_generation_pipeline import ImageToTextPipeline
 from .translation_pipeline import TranslationPipeline
 from .fill_mask_pipeline import FillMaskPipeline
 from .text_classification_pipeline import TextClassificationPipeline

@@ -33,8 +33,9 @@ from mindspore.dataset.engine.datasets import BatchDataset, RepeatDataset
 
 from mindformers.tools import logger
 from mindformers.mindformer_book import print_dict
-from ..auto_class import AutoModel
-from ..models import BaseModel, BaseTokenizer, BaseImageProcessor
+from mindformers.models.modeling_utils import PreTrainedModel
+
+from ..models import BaseTokenizer, BaseImageProcessor
 
 
 class _ScikitCompat(ABC):
@@ -56,9 +57,9 @@ class Pipeline(_ScikitCompat):
     Base Pipeline For All Task Pipelines
 
     Args:
-        model (Union[str, BaseModel]):
+        model (Union[str, PreTrainedModel]):
             The model used to perform task, the input could be a supported model name, or a model instance inherited
-            from BaseModel.
+            from PreTrainedModel.
         tokenizer (Optional[BaseTokenizer]):
             The tokenizer of model, it could be None if the model do not need tokenizer.
         image_processor (Optional[BaseImageProcessor]):
@@ -77,28 +78,22 @@ class Pipeline(_ScikitCompat):
     """
     _support_list = {}
 
-    def __init__(self, model: Union[str, BaseModel, Model],
+    def __init__(self, model: Union[PreTrainedModel, Model],
                  tokenizer: Optional[BaseTokenizer] = None,
-                 feature_extractor: Optional = None,
+                 feature_extractor=None,
                  image_processor: Optional[BaseImageProcessor] = None,
                  framework: Optional[str] = "ms",
                  task: str = "",
                  binary_output: bool = False,
                  **kwargs):
         super(Pipeline, self).__init__()
-        if isinstance(model, str):
-            model = AutoModel.from_pretrained(model)
-        if not isinstance(model, (BaseModel, Model)):
-            raise TypeError(f"model should be inherited from BaseModel or Model, but got type {type(model)}.")
         self.model = model
-        if isinstance(model, str) and model in self._support_list:
-            self.network = AutoModel.from_pretrained(model)
-        elif isinstance(model, BaseModel):
+        if isinstance(model, PreTrainedModel):
             self.network = model
         elif isinstance(model, Model):
             self.network = model.predict_network
         else:
-            raise TypeError(f"model should be str or inherited from BaseModel or Model, but got type {type(model)}.")
+            raise TypeError(f"model should be inherited from PreTrainedModel or Model, but got type {type(model)}.")
         self.framework = framework
         self.task = task
         self.binary_output = binary_output

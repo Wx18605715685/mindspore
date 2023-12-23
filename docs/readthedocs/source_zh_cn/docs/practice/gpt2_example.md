@@ -863,7 +863,7 @@ if __name__ == "__main__":
 
 **使用MindFormers已支持的task，请参考[Trainer API](Using_Api.md#trainer)，[Pipeline API](Using_Api.md#pipeline)，[Task](../task_cards/index.html)。**
 
-GPT2作为大语言模型，其主要的task是文本生成和对话问答方面的内容，本小节将以文本生成任务为例，介绍实现GPT2文本生成的具体逻辑以及任务注册的过程。在`Mindformers`中，各类下游任务，如`文本生成`、`图像分类`、`对话问答`等任务以`Pipeline`的形式构建，目前`Mindformers`仓中已实现了`BasePipeline`基类。需要完成的`TextGenerationPipeline`可直接继承`BasePipeline`实现具体的逻辑，如需实现的下游任务类型较为复杂，则用户可自行从头编写`Pipeline`类的逻辑。
+GPT2作为大语言模型，其主要的task是文本生成和对话问答方面的内容，本小节将以文本生成任务为例，介绍实现GPT2文本生成的具体逻辑以及任务注册的过程。在`Mindformers`中，各类下游任务，如`文本生成`、`图像分类`、`对话问答`等任务以`Pipeline`的形式构建，目前`Mindformers`仓中已实现了`Pipeline`基类。需要完成的`TextGenerationPipeline`可直接继承`Pipeline`实现具体的逻辑，如需实现的下游任务类型较为复杂，则用户可自行从头编写`Pipeline`类的逻辑。
 
 - `@MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="text_generation")`该装饰器完成了对`TextGenerationPipeline`的注册，由此可以通过配置文件使用高级接口进行实例化。
 - `TextGenerationPipeline`中包含了输入数据的前、中、后处理，主要涵盖以下的过程：
@@ -877,7 +877,7 @@ GPT2作为大语言模型，其主要的task是文本生成和对话问答方面
     __all__ = ['TextGenerationPipeline']
 
     @MindFormerRegister.register(MindFormerModuleType.PIPELINE, alias="text_generation")
-    class TextGenerationPipeline(BasePipeline):
+    class TextGenerationPipeline(Pipeline):
         """class description"""
         _support_list = _setup_support_list(["gpt2", "glm"])
         return_name = 'text_generation'
@@ -972,7 +972,7 @@ GPT2作为大语言模型，其主要的task是文本生成和对话问答方面
     class GenerationMixin:
         """class description"""
         def __init__(self):
-            pass  
+            pass
         ...
 
         def _forward(self, origin_inputs, top_k, top_p, repetition_penalty, max_length, eos_token_id, streamer=None, pad_token_id=None):
