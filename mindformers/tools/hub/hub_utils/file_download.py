@@ -12,38 +12,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""file download"""
+
 import os
 import re
 import copy
 import uuid
 import time
+import requests
 import shutil
 import tempfile
 import threading
+import contextlib
 
-
+from tqdm import tqdm
 from pathlib import Path
+from filelock import FileLock
 from functools import partial
 from functools import lru_cache
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
-from sysconfig import get_python_version
-import contextlib
+from requests.adapters import HTTPAdapter
 from contextlib import contextmanager
 from typing import BinaryIO, Dict, Union, Optional, Any
-
-import requests
-from requests.adapters import HTTPAdapter
-from tqdm import tqdm
-from filelock import FileLock
-
+from .utils import build_mds_headers
 from .constant import (
     BACKEND_FACTORY_T,
     DEFAULT_REVISION,
     MINDSEED_CO_URL_TEMPLATE,
     ENDPOINT,
-    # HTTP_METHOD_T,
     MDS_HUB_CACHE,
     DEFAULT_REQUEST_TIMEOUT,
     MINDSEED_HEADER_X_LINKED_ETAG,
@@ -51,16 +47,17 @@ from .constant import (
     DOWNLOAD_CHUNK_SIZE,
     BIG_FILE_SIZE,
 )
+from .utils._error import mds_raise_for_status, LocalEntryNotFoundError, EntryNotFoundError
 
 _CACHED_NO_EXIST = object()
 _CACHED_NO_EXIST_T = Any
 
 
 def _to_local_dir(
-        path: str,
-        local_dir: str,
-        relative_filename: str,
-        use_symlinks: Union[bool, str],
+    path: str,
+    local_dir: str,
+    relative_filename: str,
+    use_symlinks: Union[bool, str],
 ) -> str:
     """
     Place a file in a local dir (different than cache_dir).
@@ -120,23 +117,21 @@ def _int_or_none(value: Optional[str]) -> Optional[int]:
 
 
 def repo_folder_name(*, repo_id: str, repo_type: str = "file") -> str:
-    REPO_ID_SEPARATOR = "--" # pylint: disable=C0103
+    REPO_ID_SEPARATOR = "--"
     # remove all `/` occurrences to correctly convert repo to directory name
     parts = [f"{repo_type}s", *repo_id.split("/")]
     return REPO_ID_SEPARATOR.join(parts)
 
 
-# pylint: disable=W0613
 def mds_hub_url(
-        repo_id: str,
-        filename: str,
-        *,
-        subfolder: Optional[str] = None,
-        repo_type: Optional[str] = None,
-        revision: Optional[str] = None,
-        endpoint: Optional[str] = None,
+    repo_id: str,
+    filename: str,
+    *,
+    subfolder: Optional[str] = None,
+    repo_type: Optional[str] = None,
+    revision: Optional[str] = None,
+    endpoint: Optional[str] = None,
 ) -> str:
-    """get hub url"""
     if subfolder == "":
         subfolder = None
     if subfolder is not None:
@@ -162,25 +157,22 @@ def reset_sessions() -> None:
     _get_session_from_cache.cache_clear()
 
 
-# pylint: disable=W0613
 @lru_cache(128)
 def _get_session_from_cache(process_id: int, thread_id: int) -> requests.Session:
     return _GLOBAL_BACKEND_FACTORY()
 
 
 def get_session() -> requests.Session:
-    """get session"""
     return _get_session_from_cache(process_id=os.getpid(), thread_id=threading.get_ident())
 
 
 def _request_wrapper(
-        method,
-        url: str,
-        *,
-        follow_relative_redirects: bool = False,
-        **params,
+    method,
+    url: str,
+    *,
+    follow_relative_redirects: bool = False,
+    **params,
 ) -> requests.Response:
-    """request wrapper"""
     if follow_relative_redirects:
         response = _request_wrapper(
             method=method,
@@ -206,42 +198,35 @@ def _request_wrapper(
     return response
 
 
-# pylint: disable=W0622, C0103
 @contextlib.contextmanager
 def SoftTemporaryDirectory(
-        suffix: Optional[str] = None,
-        prefix: Optional[str] = None,
-        dir: Optional[Union[Path, str]] = None,
-        **kwargs,
+    suffix: Optional[str] = None,
+    prefix: Optional[str] = None,
+    dir: Optional[Union[Path, str]] = None,
+    **kwargs,
 ):
-    """soft temporary directory"""
     tmpdir = tempfile.TemporaryDirectory(prefix=prefix, suffix=suffix, dir=dir, **kwargs)
     yield tmpdir.name
     import stat
 
-    # pylint: disable=W0613
     def _set_write_permission_and_retry(func, path, excinfo):
         os.chmod(path, stat.S_IWRITE)
         func(path)
 
     try:
         shutil.rmtree(tmpdir.name)
-    # pylint: disable=W0703
     except Exception:
         try:
             shutil.rmtree(tmpdir.name, onerror=_set_write_permission_and_retry)
-        # pylint: disable=W0703
         except Exception:
             pass
     try:
         tmpdir.cleanup()
-    # pylint: disable=W0703
     except Exception:
         pass
 
 
 def are_symlinks_supported(cache_dir: Union[str, Path, None] = None) -> bool:
-    """check symlinks supported"""
     if cache_dir is None:
         cache_dir = MDS_HUB_CACHE
     cache_dir = str(Path(cache_dir).expanduser().resolve())  # make it unique
@@ -266,7 +251,6 @@ def are_symlinks_supported(cache_dir: Union[str, Path, None] = None) -> bool:
 
 
 def _create_symlink(src: str, dst: str, new_blob: bool = False) -> None:
-    """create symlink"""
     try:
         os.remove(dst)
     except OSError:
@@ -284,11 +268,11 @@ def _create_symlink(src: str, dst: str, new_blob: bool = False) -> None:
     try:
         try:
             commonpath = os.path.commonpath([abs_src, abs_dst])
-            _support_symlinks = are_symlinks_supported(os.path.dirname(commonpath)) # pylint: disable=C0103
+            _support_symlinks = are_symlinks_supported(os.path.dirname(commonpath))
         except ValueError:
-            _support_symlinks = os.name != "nt" # pylint: disable=C0103
+            _support_symlinks = os.name != "nt"
     except PermissionError:
-        _support_symlinks = are_symlinks_supported(os.path.dirname(abs_dst)) # pylint: disable=C0103
+        _support_symlinks = are_symlinks_supported(os.path.dirname(abs_dst))
 
     if _support_symlinks:
         src_rel_or_abs = relative_src or abs_src
@@ -300,63 +284,13 @@ def _create_symlink(src: str, dst: str, new_blob: bool = False) -> None:
         shutil.copyfile(src, dst)
 
 
-def get_token_to_send(token: Optional[Union[bool, str]]) -> Optional[str]:
-    """Select the token to send from either `token` or the cache."""
-    # Case token is explicitly provided
-    if isinstance(token, str):
-        return token
-
-    # Case token is explicitly forbidden
-    if token is False:
-        return None
-
-    # Token is not provided: we get it from local cache
-    # cached_token = MdsFolder().get_token()
-    cached_token = ""
-    # Case token is explicitly required
-    if token is True:
-        if cached_token is None:
-            raise "Token is required (`token=True`), but no token found."
-        return cached_token
-
-    # Otherwise: we use the cached token as the user has not explicitly forbidden it
-    return cached_token
-
-
-def _build_ml_headers(
-        *,
-        token: Optional[Union[bool, str]] = None,
-        library_name: Optional[str] = None,
-        library_version: Optional[str] = None,
-        user_agent: Union[Dict, str, None] = None,
-        is_write_action: bool = False,
-) -> Dict[str, str]:
-    """build ml headers"""
-    # Construct user-agent string
-    ua = f"{library_name}/{library_version}" if library_name else "unknown/None"
-    ua += f"; python/{get_python_version()}"
-
-    if isinstance(user_agent, dict):
-        ua += "; " + "; ".join(f"{k}/{v}" for k, v in user_agent.items())
-    elif isinstance(user_agent, str):
-        ua += "; " + user_agent
-
-    ua = _deduplicate_user_agent(ua)
-
-    # Build headers
-    headers = {"user-agent": ua}
-    headers["authorization"] = f"Bearer {token}"
-    return headers
-
-
 def get_mds_file_metadata(
-        url: str,
-        token: Union[bool, str, None] = None,
-        proxies: Optional[Dict] = None,
-        timeout: Optional[float] = DEFAULT_REQUEST_TIMEOUT,
+    url: str,
+    token: Union[bool, str, None] = None,
+    proxies: Optional[Dict] = None,
+    timeout: Optional[float] = DEFAULT_REQUEST_TIMEOUT,
 ) -> MdsFileMetadata:
-    """get mds file metadata"""
-    headers = _build_ml_headers()
+    headers = build_mds_headers()
     headers["Accept-Encoding"] = "identity"
     # Retrieve metadata
     r = _request_wrapper(
@@ -378,7 +312,6 @@ def get_mds_file_metadata(
 
 
 def _get_pointer_path(storage_folder: str, revision: str, relative_filename: str) -> str:
-    """get pointer path"""
     # Using `os.path.abspath` instead of `Path.resolve()` to avoid resolving symlinks
     snapshot_path = os.path.join(storage_folder, "snapshots")
     pointer_path = os.path.join(snapshot_path, revision, relative_filename)
@@ -399,24 +332,24 @@ def _cache_commit_hash_for_specific_revision(storage_folder: str, revision: str,
             ref_path.write_text(commit_hash)
 
 
-# pylint: disable=R1710
 def http_get(
-        url: str,
-        temp_file: BinaryIO,
-        *,
-        proxies=None,
-        resume_size: float = 0,
-        headers: Optional[Dict[str, str]] = None,
-        expected_size: Optional[int] = None,
-        _nb_retries: int = 5, # pylint: disable=C0103
+    url: str,
+    temp_file: BinaryIO,
+    *,
+    proxies=None,
+    resume_size: float = 0,
+    headers: Optional[Dict[str, str]] = None,
+    expected_size: Optional[int] = None,
+    _nb_retries: int = 5,
 ):
-    """http get"""
     initial_headers = headers
     headers = copy.deepcopy(headers) or {}
     if resume_size > 0:
         headers["Range"] = "bytes=%d-" % (resume_size,)
 
     r = _request_wrapper(method="GET", url=url, stream=True, proxies=proxies, headers=headers, timeout=10)
+
+    mds_raise_for_status(r)
 
     content_length = r.headers.get("Content-Length")
 
@@ -425,7 +358,7 @@ def http_get(
     displayed_name = url
     content_disposition = r.headers.get("Content-Disposition")
     if content_disposition is not None:
-        HEADER_FILENAME_PATTERN = re.compile(r'filename="(?P<filename>.*?)";') # pylint: disable=C0103
+        HEADER_FILENAME_PATTERN = re.compile(r'filename="(?P<filename>.*?)";')
         match = HEADER_FILENAME_PATTERN.search(content_disposition)
         if match is not None:
             # Means file is on CDN
@@ -444,11 +377,11 @@ def http_get(
 
     # Stream file to buffer
     with tqdm(
-            unit="B",
-            unit_scale=True,
-            total=total,
-            initial=resume_size,
-            desc=displayed_name,
+        unit="B",
+        unit_scale=True,
+        total=total,
+        initial=resume_size,
+        desc=displayed_name,
     ) as progress:
         new_resume_size = resume_size
         try:
@@ -457,7 +390,7 @@ def http_get(
                     progress.update(len(chunk))
                     temp_file.write(chunk)
                     new_resume_size += len(chunk)
-                    _nb_retries = 5 # pylint: disable=C0103
+                    _nb_retries = 5
         except (requests.ConnectionError, requests.ReadTimeout):
             if _nb_retries <= 0:
                 raise
@@ -482,7 +415,6 @@ def http_get(
 
 
 def _chmod_and_replace(src: str, dst: str) -> None:
-    """chmod and replace"""
     import stat
 
     tmp_file = Path(dst).parent.parent / f"tmp_{uuid.uuid4()}"
@@ -501,14 +433,16 @@ def get_gitea_hash(repo_id, file_path):
     data = response.json()
     if isinstance(data, list):
         return data[0].get("sha", "commit_hash_not_found")
-    raise "cannot find files on repo, please check repo id and file name"
+    else:
+        return "not_exist_file"
 
 
 def try_to_load_from_cache(
-        repo_id: str,
-        filename: str,
-        cache_dir: Union[str, Path, None] = None,
-        revision: Optional[str] = None,
+    repo_id: str,
+    filename: str,
+    cache_dir: Union[str, Path, None] = None,
+    revision: Optional[str] = None,
+    **kwargs
 ) -> Union[str, _CACHED_NO_EXIST_T, None]:
     """
     Explores the cache to return the latest cached file for a given revision if found.
@@ -592,23 +526,23 @@ def try_to_load_from_cache(
 
 
 def mds_hub_download(
-        repo_id: str,
-        filename: str,
-        *,
-        subfolder: Optional[str] = None,
-        repo_type: Optional[str] = None,
-        revision: Optional[str] = None,
-        cache_dir: Union[str, Path, None] = MDS_HUB_CACHE,
-        local_dir: Union[str, Path, None] = None,
-        local_dir_use_symlinks: Union[bool, str] = "auto",
-        user_agent: Union[Dict, str, None] = None,
-        force_download: bool = False,
-        proxies: Optional[Dict] = None,
-        token: Union[bool, str, None] = None,
-        local_files_only: bool = False,
-        endpoint: Optional[str] = None,
-        resume_download: bool = False,
-        force_filename: Optional[str] = None,
+    repo_id: str,
+    filename: str,
+    *,
+    subfolder: Optional[str] = None,
+    repo_type: Optional[str] = None,
+    revision: Optional[str] = None,
+    cache_dir: Union[str, Path, None] = MDS_HUB_CACHE,
+    local_dir: Union[str, Path, None] = None,
+    local_dir_use_symlinks: Union[bool, str] = "auto",
+    user_agent: Union[Dict, str, None] = None,
+    force_download: bool = False,
+    proxies: Optional[Dict] = None,
+    token: Union[bool, str, None] = None,
+    local_files_only: bool = False,
+    endpoint: Optional[str] = None,
+    resume_download: bool = False,
+    force_filename: Optional[str] = None,
 ) -> str:
     """
     args：
@@ -649,10 +583,21 @@ def mds_hub_download(
         Local path (string) of file or if networking is off, last version of
         file cached on disk.
     """
-    customer_hash = get_gitea_hash(repo_id, filename)
-
     if revision is None:
         revision = DEFAULT_REVISION
+
+    storage_folder = os.path.join(cache_dir, repo_folder_name(repo_id=repo_id))
+    os.makedirs(storage_folder, exist_ok=True)
+    relative_filename = os.path.join(*filename.split("/"))
+
+    customer_hash = get_gitea_hash(repo_id, filename)
+    if customer_hash == "not_exist_file":
+        no_exist_file_path = Path(storage_folder) / ".no_exist" / customer_hash / relative_filename
+        no_exist_file_path.parent.mkdir(parents=True, exist_ok=True)
+        no_exist_file_path.touch()
+        _cache_commit_hash_for_specific_revision(storage_folder, revision, customer_hash)
+        raise EntryNotFoundError("file not found")
+
     if isinstance(cache_dir, Path):
         cache_dir = str(cache_dir)
     if isinstance(local_dir, Path):
@@ -663,10 +608,6 @@ def mds_hub_download(
     if subfolder is not None:
         # This is used to create a URL, and not a local path, hence the forward slash.
         filename = f"{subfolder}/{filename}"
-
-    storage_folder = os.path.join(cache_dir, repo_folder_name(repo_id=repo_id))
-
-    os.makedirs(storage_folder, exist_ok=True)
 
     # cross platform transcription of filename, to be used as a local file path.
     relative_filename = os.path.join(*filename.split("/"))
@@ -686,7 +627,7 @@ def mds_hub_download(
         endpoint=endpoint,
         repo_type=repo_type,
     )
-    headers = _build_ml_headers(user_agent=user_agent)
+    headers = build_mds_headers(user_agent=user_agent)
 
     url_to_download = url
     metadata = None
@@ -713,7 +654,7 @@ def mds_hub_download(
             return pointer_path
 
     if local_files_only:
-        raise "cannot find files, please try local_files_only=False"
+        raise LocalEntryNotFoundError("An error happened while trying to locate the file on the disk")
     # Etag must exist
     etag = metadata.etag
 
