@@ -14,6 +14,7 @@
 # ============================================================================
 
 """models init"""
+from .auto import *
 from .bert import *
 from .mae import *
 from .vit import *
@@ -56,3 +57,4 @@ __all__.extend(llama.__all__)
 __all__.extend(pangualpha.__all__)
 __all__.extend(bloom.__all__)
 __all__.extend(base_tokenizer.__all__)
+__all__.extend(auto.__all__)

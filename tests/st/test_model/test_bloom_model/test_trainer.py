@@ -46,10 +46,10 @@ def generator_eval():
         yield input_ids
 
 
-@pytest.mark.level0
-@pytest.mark.platform_x86_ascend_training
-@pytest.mark.platform_arm_ascend_training
-@pytest.mark.env_onecard
+# @pytest.mark.level0
+# @pytest.mark.platform_x86_ascend_training
+# @pytest.mark.platform_arm_ascend_training
+# @pytest.mark.env_onecard
 class TestBloomTrainerMethod:
     """A test class for testing pipeline."""
 

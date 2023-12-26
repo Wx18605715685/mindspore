@@ -22,7 +22,7 @@ from typing import Dict, Optional, Union
 
 # Build the list of all image processors
 from mindformers.tools import get_file_from_repo, get_class_from_dynamic_module, resolve_trust_remote_code
-from mindformers.models import CONFIG_NAME, IMAGE_PROCESSOR_NAME
+from mindformers.models.utils import CONFIG_NAME, IMAGE_PROCESSOR_NAME
 from mindformers.tools import logger
 from ..configuration_utils import PretrainedConfig
 from ..image_processing_utils import ImageProcessingMixin
