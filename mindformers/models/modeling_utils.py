@@ -25,53 +25,23 @@ import mindspore as ms
 from mindspore import nn
 from mindspore import load_checkpoint, load_param_into_net
 
-from mindformers.tools.hub import PushToHubMixin, cached_file, download_url, extract_commit_hash, is_offline_mode, is_remote_url
+from mindformers.tools.hub import (
+    PushToHubMixin,
+    cached_file,
+    download_url,
+    extract_commit_hash,
+    is_offline_mode,
+    is_remote_url,
+    get_checkpoint_shard_files,
+    convert_file_size_to_int,
+    has_file
+)
 from mindformers.tools.hub.dynamic_module_utils import custom_object_save
 from mindformers.generation import GenerationConfig, GenerationMixin
 from mindformers.tools.logger import logger
 
 from .configuration_utils import PretrainedConfig
 from .utils import CONFIG_NAME, WEIGHTS_NAME, WEIGHTS_INDEX_NAME
-
-
-# temp
-def convert_file_size_to_int(size: Union[int, str]):
-    """
-    Converts a size expressed as a string with digits an unit (like `"5MB"`) to an integer (in bytes).
-
-    Args:
-        size (`int` or `str`): The size to convert. Will be directly returned if an `int`.
-
-    Example:
-    ```py
-    >>> convert_file_size_to_int("1MiB")
-    1048576
-    ```
-    """
-    if isinstance(size, int):
-        return size
-    if size.upper().endswith("GIB"):
-        return int(size[:-3]) * (2**30)
-    if size.upper().endswith("MIB"):
-        return int(size[:-3]) * (2**20)
-    if size.upper().endswith("KIB"):
-        return int(size[:-3]) * (2**10)
-    if size.upper().endswith("GB"):
-        int_size = int(size[:-2]) * (10**9)
-        return int_size // 8 if size.endswith("b") else int_size
-    if size.upper().endswith("MB"):
-        int_size = int(size[:-2]) * (10**6)
-        return int_size // 8 if size.endswith("b") else int_size
-    if size.upper().endswith("KB"):
-        int_size = int(size[:-2]) * (10**3)
-        return int_size // 8 if size.endswith("b") else int_size
-    raise ValueError("`size` is not in a valid format. Use an integer followed by the unit, e.g., '5GB'.")
-def get_checkpoint_shard_files(pretrained_model_name_or_path, index_filename, subfolder, **kwargs):
-    with open(index_filename, "r") as f:
-        index = json.loads(f.read())
-    shard_filenames = sorted(set(index["weight_map"].values()))
-    shard_filenames = [os.path.join(pretrained_model_name_or_path, subfolder, f) for f in shard_filenames]
-    return shard_filenames, kwargs
 
 
 def dtype_byte_size(dtype):

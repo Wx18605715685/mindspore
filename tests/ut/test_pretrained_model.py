@@ -47,7 +47,7 @@ class TestPretrainedModel(unittest.TestCase):
 
     def test_load_and_save_shard(self):
         """test load and save GPT2LMHeadModel with shard"""
-        model_1 = GPT2LMHeadModel.from_pretrained("mf-ut/pretrianedmodel_ut")
+        model_1 = GPT2LMHeadModel.from_pretrained("mf-ut/pretrained_shard_model_ut")
         state_dict_1 = {}
         for item in model_1.get_parameters():
             state_dict_1[item.name] = item.data
