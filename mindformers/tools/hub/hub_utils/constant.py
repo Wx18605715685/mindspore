@@ -40,7 +40,7 @@ MDS_TOKEN_PATH = os.path.join(MDS_HOME, "token")
 MDS_HUB_DISABLE_IMPLICIT_TOKEN: bool = _is_true(os.environ.get("MDS_HUB_DISABLE_IMPLICIT_TOKEN"))
 
 DEFAULT_REVISION = "main"
-ENDPOINT = "https://gitea.test.osinfra.cn/"
+ENDPOINT = os.getenv("MODELFOUNDRY_HUB_ENDPOINT", "https://gitea.test.osinfra.cn/")
 MINDSEED_CO_URL_TEMPLATE = ENDPOINT + "/{repo_id}/media/branch/{revision}/{filename}"
 DEFAULT_REQUEST_TIMEOUT = 10
 HTTP_METHOD_T = ["GET", "OPTIONS", "HEAD", "POST", "PUT", "PATCH", "DELETE"]

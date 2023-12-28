@@ -22,10 +22,9 @@ import mindspore.common.dtype as mstype
 from mindformers.models.blip2.qformer_config import QFormerConfig
 from mindformers.models.llama import LlamaConfig
 from mindformers.models.vit import ViTConfig
-from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from mindformers.models.base_config import BaseConfig
-from mindformers.mindformer_book import MindFormerBook
+from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.modules.transformer import TransformerOpParallelConfig, TransformerRecomputeConfig
+from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 __all__ = ['Blip2Config']
 
@@ -34,7 +33,7 @@ default_parallel_config = TransformerOpParallelConfig(recompute=default_recomput
 
 
 @MindFormerRegister.register(MindFormerModuleType.CONFIG)
-class Blip2Config(BaseConfig):
+class Blip2Config(PretrainedConfig):
     r"""
     Config For BLIP2 Module
 
@@ -76,7 +75,8 @@ class Blip2Config(BaseConfig):
     Returns:
         Class, Blip2Config.
     """
-    _support_list = MindFormerBook.get_config_support_list()['blip2']
+
+    model_type = "blip2"
 
     def __init__(self,
                  model_type: str = "blip2",
@@ -98,7 +98,7 @@ class Blip2Config(BaseConfig):
                  is_training: bool = True,
                  micro_batch_interleave_num=1,
                  **kwargs):
-        super(Blip2Config, self).__init__(**kwargs)
+        super().__init__(**kwargs)
         self.model_type = model_type
         self.batch_size = batch_size
         self.freeze_vision = freeze_vision

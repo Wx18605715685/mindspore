@@ -50,8 +50,6 @@ def image_processor_class_from_name(class_name: str):
     """Return image processor class from class name."""
     for module_name, extractors in IMAGE_PROCESSOR_MAPPING_NAMES.items():
         if class_name in extractors:
-            module_name = model_type_to_module_name(module_name)
-
             module = importlib.import_module(f".{module_name}", "mindformers.models")
             try:
                 return getattr(module, class_name)

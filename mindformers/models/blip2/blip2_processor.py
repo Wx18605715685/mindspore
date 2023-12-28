@@ -24,9 +24,9 @@ import PIL.Image
 
 import mindspore as ms
 
-from mindformers.mindformer_book import MindFormerBook
-from mindformers.models.base_processor import BaseProcessor
 from mindformers.models.image_processing_utils import BaseImageProcessor
+from mindformers.models.processing_utils import ProcessorMixin
+from mindformers.models.tokenization_utils_base import PreTrainedTokenizerBase
 from mindformers.dataset.transforms.vision_transforms import (
     BatchPILize,
     BatchResize,
@@ -36,6 +36,7 @@ from mindformers.dataset.transforms.vision_transforms import (
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
 
 
+@MindFormerRegister.register(MindFormerModuleType.PROCESSOR)
 class Blip2ImageProcessor(BaseImageProcessor):
     """
     Blip2ImageProcessor.
@@ -124,7 +125,7 @@ class Blip2ImageProcessor(BaseImageProcessor):
 
 
 @MindFormerRegister.register(MindFormerModuleType.PROCESSOR)
-class Blip2Processor(BaseProcessor):
+class Blip2Processor(ProcessorMixin):
     r"""Blip2 Processor,
     consists of a feature extractor (BaseFeatureEXtractor) for image input,
     and a tokenizer (BaseTokenizer) for text input.
@@ -162,13 +163,49 @@ class Blip2Processor(BaseProcessor):
        [[ 101, 1037, 2879 ...    0,    0,    0],
        [ 101, 1037, 2611 ...    0,    0,    0]])}
     """
-    _support_list = MindFormerBook.get_processor_support_list()['blip2']
 
-    def __init__(self, image_processor, tokenizer,
-                 max_length=32, padding='max_length', return_tensors='ms'):
-        super(Blip2Processor, self).__init__(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            max_length=max_length,
-            padding=padding,
-            return_tensors=return_tensors)
+    attributes = ["image_processor", "tokenizer"]
+    image_processor_class = "Blip2ImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
+    def __init__(self, image_processor, tokenizer):
+        tokenizer.return_token_type_ids = False
+        super().__init__(image_processor, tokenizer)
+        self.current_processor = self.image_processor
+
+    def __call__(
+            self,
+            images=None,
+            text=None,
+            add_special_tokens: bool = True,
+            padding=False,
+            truncation=None,
+            max_length=None,
+            return_tensors=None,
+            **kwargs):
+        """call function"""
+        output = {}
+
+        if images is not None and self.image_processor:
+            if not isinstance(self.image_processor, BaseImageProcessor):
+                raise TypeError(f"feature_extractor should inherit from the BaseImageProcessor,"
+                                f" but got {type(self.image_processor)}.")
+
+            image_output = self.image_processor(images)
+            output['image'] = image_output
+
+        if text is not None and self.tokenizer:
+            if not isinstance(self.tokenizer, PreTrainedTokenizerBase):
+                raise TypeError(f"tokenizer should inherited from the BaseTokenizer,"
+                                f" but got {type(self.tokenizer)}.")
+            # Format the input into a batch
+            if isinstance(text, str):
+                text = [text]
+            text_output = self.tokenizer(text,
+                                         return_tensors=return_tensors,
+                                         max_length=max_length,
+                                         padding=padding)["input_ids"]
+            output['text'] = text_output
+
+        return output
+    

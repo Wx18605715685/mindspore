@@ -18,7 +18,7 @@
 __version__ = "0.0.1dev"
 
 from mindformers import core, auto_class, dataset, \
-    models, modules, wrapper, tools
+    models, modules, wrapper, tools, generation
 from mindformers.pipeline import *
 from mindformers.trainer import *
 from mindformers.core import *

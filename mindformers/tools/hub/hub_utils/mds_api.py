@@ -86,7 +86,7 @@ def post_lfs_batch_info(
     }
     endpoint = endpoint if endpoint is not None else ENDPOINT
     url_prefix = ""
-    batch_url = f"{endpoint}{url_prefix}{repo_id}.git/info/lfs/objects/batch"
+    batch_url = f"{endpoint}/{url_prefix}{repo_id}.git/info/lfs/objects/batch"
     payload: Dict = {
         "operation": "upload",
         "transfers": ["basic", "multipart"],
