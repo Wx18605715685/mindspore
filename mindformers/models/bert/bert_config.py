@@ -16,14 +16,13 @@
 
 import mindspore.common.dtype as mstype
 from mindformers.modules.transformer.transformer import default_transformer_config, default_moe_config
+from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.tools.register import MindFormerRegister, MindFormerModuleType
-from ..base_config import BaseConfig
-from ...mindformer_book import MindFormerBook
 
 __all__ = ['BertConfig']
 
 @MindFormerRegister.register(MindFormerModuleType.CONFIG)
-class BertConfig(BaseConfig):
+class BertConfig(PretrainedConfig):
     """
     BERT config class which defines the model size.
 
@@ -81,10 +80,6 @@ class BertConfig(BaseConfig):
     Returns:
         Class, BertConfig.
     """
-    _support_list = MindFormerBook.get_config_support_list()['bert']
-    _support_list.extend(MindFormerBook.get_config_support_list()['tokcls']['bert'])
-    _support_list.extend(MindFormerBook.get_config_support_list()['txtcls']['bert'])
-    _support_list.extend(MindFormerBook.get_config_support_list()['qa']['bert'])
 
     def __init__(self,
                  model_type: str = "bert",

@@ -34,6 +34,7 @@ from .base_config import BaseConfig
 from .base_model import BaseModel
 from .base_processor import BaseProcessor, BaseAudioProcessor
 from .image_processing_utils import BaseImageProcessor
+from .tokenization_utils_base import PreTrainedTokenizerBase
 from .build_tokenizer import build_tokenizer
 from .build_processor import build_processor
 from .build_model import build_model_config, build_head, \
@@ -41,7 +42,7 @@ from .build_model import build_model_config, build_head, \
 from .utils import CONFIG_NAME, FEATURE_EXTRACTOR_NAME, IMAGE_PROCESSOR_NAME
 
 __all__ = ['BaseConfig', 'BaseModel', 'BaseProcessor', 'BaseImageProcessor',
-           'BaseAudioProcessor']
+           'BaseAudioProcessor', 'PreTrainedTokenizerBase']
 
 __all__.extend(blip2.__all__)
 __all__.extend(bert.__all__)
