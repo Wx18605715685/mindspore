@@ -14,30 +14,32 @@
 # ============================================================================
 """test PretrainedConfig"""
 import os
-import shutil
+import tempfile
 import unittest
 from mindformers import TransformerOpParallelConfig, MoEConfig
 from mindformers.models import GPT2Config
 
 class TestPretrainedConfig(unittest.TestCase):
     """test PretrainedConfig"""
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = self.temp_dir.name
+        self.config_path = self.path+"/config.json"
+
     def test_save_and_read(self):
         """test save and read config.json"""
         config1 = GPT2Config()
 
-        os.makedirs('./test_pretrained_config')
-        config1.save_pretrained('./test_pretrained_config')
+        config1.save_pretrained(self.path)
 
-        self.assertEqual(os.path.isfile('./test_pretrained_config/config.json'), True)
+        self.assertEqual(os.path.isfile(self.config_path), True)
 
-        config2 = GPT2Config.from_pretrained('./test_pretrained_config/config.json')
-        config3 = GPT2Config.from_pretrained('./test_pretrained_config')
-        config4 = GPT2Config.from_json_file('./test_pretrained_config/config.json')
+        config2 = GPT2Config.from_pretrained(self.config_path)
+        config3 = GPT2Config.from_pretrained(self.path)
+        config4 = GPT2Config.from_json_file(self.config_path)
 
         self.assertEqual(config2, config3)
         self.assertEqual(config2, config4)
-
-        shutil.rmtree('./test_pretrained_config')
 
     def test_save_and_read_2(self):
         """test save and read config.json with different config"""
@@ -47,19 +49,16 @@ class TestPretrainedConfig(unittest.TestCase):
             batch_size=2
         )
 
-        os.makedirs('./test_pretrained_config')
-        config1.save_pretrained('./test_pretrained_config')
+        config1.save_pretrained(self.path)
 
-        self.assertEqual(os.path.isfile('./test_pretrained_config/config.json'), True)
+        self.assertEqual(os.path.isfile(self.config_path), True)
 
-        config2 = GPT2Config.from_pretrained('./test_pretrained_config/config.json')
-        config3 = GPT2Config.from_pretrained('./test_pretrained_config')
-        config4 = GPT2Config.from_json_file('./test_pretrained_config/config.json')
+        config2 = GPT2Config.from_pretrained(self.config_path)
+        config3 = GPT2Config.from_pretrained(self.path)
+        config4 = GPT2Config.from_json_file(self.config_path)
 
         self.assertEqual(config2, config3)
         self.assertEqual(config2, config4)
         self.assertEqual(config2.parallel_config,
                          TransformerOpParallelConfig(data_parallel=2, recompute={"recompute": True}))
         self.assertEqual(config2.moe_config, MoEConfig(expert_num=2))
-
-        shutil.rmtree('./test_pretrained_config')
