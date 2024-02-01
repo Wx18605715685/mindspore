@@ -18,3 +18,4 @@
 "mindformers/mindformers/tools/hub/hub_utils/"                                                           "catching-non-exception"
 "mindformers/mindformers/tools/hub/hub_utils/"                                                           "unused-import"
 "mindformers/mindformers/tools/hub/hub_utils/"                                                           "pointless-statement"
+"mindformers/tests/ut/test_auto_config.py"                                                               "wrong-import-position"
