@@ -25,7 +25,8 @@ import numpy as np
 sys.path.append(os.getcwd())
 sys.path.append(os.path.join(os.getcwd(), ".."))
 
-from mindformers import Trainer, MindFormerConfig, CLIPVisionConfig, MindFormerRegister, MindFormerModuleType
+from mindformers import Trainer, MindFormerConfig, CLIPVisionConfig, MindFormerRegister, MindFormerModuleType, \
+    BatchNormalize, BatchToTensor, build_profile_cb
 from mindformers.models import build_processor
 from mindformers.core.context import build_context
 from mindformers.tools import get_output_root_path
@@ -50,6 +51,9 @@ def register_modules():
     MindFormerRegister.register_cls(QwenVLTransform, MindFormerModuleType.TRANSFORMS)
     MindFormerRegister.register_cls(QwenVLProcessor, MindFormerModuleType.PROCESSOR)
     MindFormerRegister.register_cls(QwenVLImageProcessor, MindFormerModuleType.PROCESSOR)
+
+    MindFormerRegister.register_cls(BatchNormalize, MindFormerModuleType.TRANSFORMS)
+    MindFormerRegister.register_cls(BatchToTensor, MindFormerModuleType.TRANSFORMS)
 
 
 if check_in_modelarts():
@@ -111,6 +115,9 @@ def main(config='run_qwenvl_910b.yaml',
 
     # init context
     build_context(config)
+
+    if config.profile:
+        config.profile_cb = build_profile_cb(config)
 
     if auto_trans_ckpt is not None:
         config.auto_trans_ckpt = auto_trans_ckpt

@@ -236,6 +236,7 @@ class QwenVLTokenizer(QwenTokenizer):
             sub_strs.append(path['image'])
             sub_strs.append(result[end[0]:end[1]])
             last_end_idx = end[1]
+        sub_strs.append(result[last_end_idx:])
 
         replaced_str = ''.join(sub_strs)
         return replaced_str

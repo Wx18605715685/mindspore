@@ -30,6 +30,8 @@ Qwen-VL 是阿里云研发的大规模视觉语言模型（Large Vision Language
 
    ```text
    qwen
+     ├── run_qwenvl_stage1_910b.yaml    # qwenvl第一阶段训练启动配置文件
+     ├── run_qwenvl_stage2_910b.yaml    # qwenvl第二阶段训练启动配置文件
      └── run_qwenvl_stage3_910b.yaml    # qwenvl第三阶段微调启动配置文件
    ```
 
@@ -193,6 +195,7 @@ data_loader:
       sft:
         annotation_files: [ "multi-round-chat/qwenvl_stage3_data.json" ]
     extra_kwargs:
+      max_img_len: 3
       map_function_kwargs:
         user_role_name: user
         assistant_role_name: assistant
@@ -210,6 +213,7 @@ data_loader的参数解释：
 - shuffle: 是否打乱数据集。
 - task_config: 任务配置。其中stage3对应sft名称以及其annotation_files的相对路径。如上的json含义为会从`/path/to/dataset/multi-round-chat/qwenvl_stage3_data.json`中读取annotation_files。
 - extra_kwargs: 额外的参数。
+    - max_img_len: 图片的最大数量。单个对话中的图片不足最大图片数量则会pad到最大数量。
     - map_function_kwargs: map_function的参数。
         - user_role_name: 提出问题方的名称，对应数据集中的from。
         - assistant_role_name: 回答问题方的名称，对应数据集中另外一个的from。

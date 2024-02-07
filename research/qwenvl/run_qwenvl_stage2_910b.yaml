@@ -6,7 +6,7 @@ auto_trans_ckpt: False  # If true, auto transform load_checkpoint to load in dis
 only_save_strategy: False
 resume_training: False
 use_parallel: False
-run_mode: 'finetune'
+run_mode: 'train'
 
 # trainer config
 trainer:
@@ -17,22 +17,23 @@ trainer:
 train_dataset: &train_dataset
   data_loader:
     type: QwenVLDataLoader
-    dataset_dir: "/data"
+    dataset_dir: "/data/dataset"
     image_dir: ["images"]
-    stage: 3
+    stage: 2
     column_names: ["image", "text"]
     shuffle: True
     task_config:
-      sft:
-        annotation_files: [ "multi-round-chat/qwenvl_stage3_data.json" ]
+      vqa:
+        question_files: ["vqa_v2/v2_OpenEnded_mscoco_train2014_questions.json"]
+        annotation_files: ["vqa_v2/v2_mscoco_train2014_annotations.json"]
     extra_kwargs:
-      max_img_len: 3
+      max_img_len: 5
       map_function_kwargs:
-        user_role_name: user
-        assistant_role_name: assistant
-  output_columns: ["text", "img_start_pos", "label"]
-  column_order: ["text", "image", "img_start_pos", "label"]
+        user_role_name: <|im_start|>user
+        assistant_role_name: <|im_start|>assistant
   num_parallel_workers: 8
+  output_columns: [ "text", "image_start_pos" ]
+  column_order: [ "text", "image", "image_start_pos" ]
   python_multiprocessing: False
   drop_remainder: True
   batch_size: 1
@@ -41,14 +42,20 @@ train_dataset: &train_dataset
   prefetch_size: 30
   seed: 2022
   transforms:
-    - type: BatchToTensor
-    - type: BatchNormalize
+    - type: RandomResizedCrop
+      size: 224
+      scale: [ 0.5, 1.0 ]
+      interpolation: "bicubic"
+    - type: RandomHorizontalFlip
+    - type: ToTensor
+    - type: Normalize
       mean: [ 0.48145466, 0.4578275, 0.40821073 ]
       std: [ 0.26862954, 0.26130258, 0.27577711 ]
       is_hwc: False
   text_transforms:
     type: QwenVLTransform
-    max_length: 2049
+    max_length: 513
+    task: 'stage2'
   tokenizer:
     type: QwenVLTokenizer
 
@@ -58,14 +65,14 @@ train_dataset_task:
 # runner config
 runner_config:
   epochs: 5
-  batch_size: 2
+  batch_size: 4
   sink_mode: True
   sink_size: 2
 runner_wrapper:
   type: MFTrainOneStepCell
   scale_sense:
     type: DynamicLossScaleUpdateCell
-    loss_scale_value: 64
+    loss_scale_value: 65536
     scale_factor: 2
     scale_window: 1000
   use_clip_grad: True
@@ -74,24 +81,24 @@ runner_wrapper:
 optimizer:
   type: FP32StateAdamWeightDecay
   beta1: 0.9
-  beta2: 0.95
-  eps: 1.e-8
+  beta2: 0.98
+  eps: 1.e-6
   weight_decay: 0.1
 
 # lr sechdule
 lr_schedule:
   type: CosineWithWarmUpLR
-  learning_rate: 1.e-5
-  lr_end: 1.e-6
+  learning_rate: 5.e-5
+  lr_end: 1.e-5
   warmup_lr_init: 1.e-6
-  warmup_steps: 3000
+  warmup_steps: 400
   total_steps: -1 # -1 means it will load the total steps of the datase
 
 # callbacks
 callbacks:
   - type: MFLossMonitor
   - type: CheckpointMointor
-    prefix: "qwen-vl"
+    prefix: "qwen"
     save_checkpoint_steps: 10000
     keep_checkpoint_max: 3
     integrated_save: False
@@ -100,8 +107,8 @@ callbacks:
 
 # default parallel of device num = 8 for Atlas 800T A2
 parallel_config:
-  data_parallel: 4
-  model_parallel: 2
+  data_parallel: 8
+  model_parallel: 1
   pipeline_stage: 1
   micro_batch_num: 1
   vocab_emb_dp: False
@@ -121,7 +128,7 @@ model:
   model_config:
     type: QwenVLConfig
 
-    freeze_vision: True
+    freeze_vision: False
     freeze_resampler: False
     freeze_llm: False
 
@@ -182,7 +189,7 @@ processor:
   type: QwenVLProcessor
   image_processor:
     type: QwenVLImageProcessor
-    image_size: 448  # input image size
+    image_size: 224  # input image size
   tokenizer:
     type: QwenVLTokenizer
     max_length: 32
@@ -209,17 +216,10 @@ parallel:
   enable_alltoall: False
   full_batch: True
   search_mode: "sharding_propagation"
-  enable_parallel_optimizer: False
+  enable_parallel_optimizer: True
   strategy_ckpt_config:
     save_file: "./ckpt_strategy.ckpt"
     only_trainable_params: False
   parallel_optimizer_config:
     gradient_accumulation_shard: False
     parallel_optimizer_threshold: 64
-
-  profile: False
-  profile_start_step: 5
-  profile_stop_step: 10
-  init_start_profile: False
-  profile_communication: False
-  profile_memory: True
