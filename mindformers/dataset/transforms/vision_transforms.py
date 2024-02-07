@@ -160,6 +160,7 @@ class BatchCenterCrop:
         raise TypeError(f"the type {type(image_batch)} of image_batch is unsupported.")
 
 
+@MindFormerRegister.register(MindFormerModuleType.TRANSFORMS)
 class BatchToTensor:
     """Transform a batch of image to tensor and scale to (0, 1)."""
 
@@ -195,6 +196,7 @@ class BatchToTensor:
         raise TypeError(f"the type {type(image_batch)} of image_batch is unsupported.")
 
 
+@MindFormerRegister.register(MindFormerModuleType.TRANSFORMS)
 class BatchNormalize:
     """Normalize a batch of image."""
 
