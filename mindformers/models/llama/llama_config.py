@@ -146,6 +146,7 @@ class LlamaConfig(PretrainedConfig):
                  use_rope_slice: bool = False,
                  use_flash_attention: bool = False,
                  use_paged_attention: bool = False,
+                 use_kbk_infer: bool = False,
                  use_prompt_flash_attention: bool = False,
                  use_incre_flash_attention: bool = False,
                  fine_grain_interleave: int = 1,
@@ -218,6 +219,7 @@ class LlamaConfig(PretrainedConfig):
         self.top_p = top_p
         self.do_sample = do_sample
         self.theta = theta
+        self.use_kbk_infer = use_kbk_infer
         self.block_size = block_size
         self.num_blocks = num_blocks
         if batch_size * seq_length // self.block_size > self.num_blocks:

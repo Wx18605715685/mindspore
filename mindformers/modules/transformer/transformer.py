@@ -76,6 +76,7 @@ from mindformers.tools.logger import logger as log
 __all__ = [
     "AttentionMask",
     "AttentionMaskHF",
+    "FlashAttentionScore",
     "LowerTriangularMaskWithDynamic",
     "VocabEmbedding",
     "MultiHeadAttention",
@@ -1020,13 +1021,14 @@ class VocabEmbedding(Cell):
                                 embedding_size=Validator.check_positive_int,
                                 parallel_config=_valid_type_checks([EmbeddingOpParallelConfig], "VocabEmbedding"))
     def __init__(self, vocab_size, embedding_size, parallel_config=default_embedding_parallel_config,
-                 param_init='normal'):
+                 param_init='normal', param_init_type=mstype.float32):
         super(VocabEmbedding, self).__init__()
         _check_config(parallel_config)
         self.vocab_size = vocab_size
         self.embedding_size = embedding_size
-        self.embedding_table = Parameter(initializer(param_init, [self.vocab_size, self.embedding_size]),
-                                         name='embedding_table', parallel_optimizer=False)
+        self.embedding_table = Parameter(
+            initializer(param_init, [self.vocab_size, self.embedding_size], param_init_type),
+            name='embedding_table', parallel_optimizer=False)
 
         if parallel_config.vocab_emb_dp:
             self.gather = P.Gather().shard(((1, 1), (parallel_config.data_parallel, 1)))
@@ -3632,3 +3634,175 @@ class Transformer(Cell):
         if self.use_moe:
             return output, encoder_layer_present, decoder_layer_present, accum_loss
         return output, encoder_layer_present, decoder_layer_present
+
+
+class FlashAttentionScore(Cell):
+    r"""
+    FlashAttention.
+    .. warning::
+        This is an experimental API that is subject to change or deletion.
+    B -- Batch size
+    S -- Sequence length
+    H -- Hidden size
+    N -- Num heads
+    D -- Dim size
+    Args:
+        head_num (int): The number of the heads.
+        keep_prob (float): The keep probability of dropout. Default: 1.0.
+        scale_value (float): The scale value. Default: 1.0.
+        pre_tokens (int): Previous tokens. Default: 65536.
+        next_tokens (int): Next tokens. Default: 65536.
+        inner_precise (int): Specify the execution mode, where 0 indicates high precision mode and 1 indicates high
+        performance mode. Default: 0.
+        input_layout (str, optional): Specifies the layout of `query`, the value must be one of ["BSH", "BNSD"].
+        Currently, only BSH is supported. Default: "BSH".
+        sparse_mode (int): Default 0.
+        use_flash_attention (bool): Use the FlashAttentionScore from ops.operations.nn_ops. Default True.
+        input_dtype (dtype.Number): The computation type of input. Default mstype.float16.
+
+    Inputs:
+        - **query** (Tensor) - The query tensor with data type must be in [float16, float32, bfloat16].
+          Input tensor of shape :math:`(B, S, H)`.
+        - **key** (Tensor) - The key tensor with data must be in [float16, float32, bfloat16].
+          Input tensor of shape :math:`(B, S, H)`.
+        - **value** (Tensor) - The value tensor with data must be in [float16, float32, bfloat16].
+          Input tensor of shape :math:`(B, S, H)`.
+        - **attn_mask** (Tensor) - The attention mask tensor with data type of uint8 or float16.
+          For each element, 0 indicates retention and 1 indicates discard. Input tensor of shape :math:`(B, 1, S, S)`.
+        - **drop_mask** (Tensor) - The dropout mask tensor with data type of UInt8.
+          Input tensor of shape :math:`(B, N, S, S // 8) or ()`.
+        - **real_shift** (None) - The position embedding code of float16 or float32, not implemented yet.
+        - **padding_mask** (None) - The padding mask of float16 or float32, not implemented yet.
+        - **prefix** (None) - Not implemented yet.
+
+    Outputs:
+        - **attention_out** (Tensor) - (B, S, H)
+
+    Supported Platforms:
+        ``Ascend``
+
+    Examples:
+        >>> import numpy as np
+        >>> from mindformers.modules.transformer import FlashAttentionScore
+        >>> from mindspore import Tensor
+        >>> B = 1
+        >>> S = 2
+        >>> H = 1280
+        >>> N = 10
+        >>> query = Tensor(np.ones((B, S, H), dtype=np.float16))
+        >>> key = Tensor(np.ones((B, S, H), dtype=np.float16))
+        >>> value = Tensor(np.ones((B, S, H), dtype=np.float16))
+        >>> attn_mask = Tensor(np.ones((B, 1, S, S), dtype=np.uint8))
+        >>> fa_op = FlashAttentionScore(head_num=N, scale_value=1.0, pre_tokens=65536, next_tokens=65536,
+        >>>                             inner_precise=0, input_layout="BSH")
+        >>> attentions_output = fa_op(query, key, value, attn_mask)
+        >>> print(res)
+        [[[1. 0. 0. 0]
+          [1. 1. 0. 0]
+          [1. 1. 1. 0]
+          [1. 1. 1. 1]]]
+    """
+
+    @_LogActionOnce(m_logger=logger, key='FlashAttention',
+                    no_warning=_get_parallel_mode() in (ParallelMode.STAND_ALONE,))
+    @_args_type_validator_check(head_num=Validator.check_positive_int,
+                                keep_prob=Validator.check_non_negative_float,
+                                scale_value=Validator.check_non_negative_float,
+                                pre_tokens=Validator.check_non_negative_int,
+                                next_tokens=Validator.check_non_negative_int,
+                                inner_precise=Validator.check_non_negative_int,
+                                sparse_mode=Validator.check_non_negative_int,
+                                use_flash_attention=Validator.check_bool)
+    def __init__(self, head_num=1, keep_prob=1.0, scale_value=1.0, pre_tokens=65536, next_tokens=65536, inner_precise=0,
+                 input_layout="BSH", sparse_mode=0, use_flash_attention=True, input_dtype=mstype.float16):
+        super(FlashAttentionScore, self).__init__()
+        self.use_flash_attention = use_flash_attention
+        if self.use_flash_attention:
+            self.flash_attention = P.nn_ops.FlashAttentionScore(head_num=head_num, keep_prob=keep_prob,
+                                                                scale_value=scale_value, pre_tokens=pre_tokens,
+                                                                next_tokens=next_tokens,
+                                                                inner_precise=inner_precise,
+                                                                input_layout=input_layout,
+                                                                sparse_mode=sparse_mode)
+        self.merger_head_transpose = P.Transpose()
+        self.shape = P.Shape()
+        self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
+        self.batch_matmul = P.BatchMatMul()
+        self.batch_matmul_q_k = P.BatchMatMul(transpose_b=True)
+        self.mul = P.Mul()
+        self.add = P.Add()
+        self.softmax = P.Softmax()
+        self.cast = P.Cast()
+        self.cast_attn = P.Cast()
+        self.softmax_dtype = mstype.float32
+        self.head_num = head_num
+        self.dtype = input_dtype
+        self.input_layout = input_layout
+
+    def construct(self, query, key, value, real_shift=None, drop_mask=None, padding_mask=None, attn_mask=None,
+                  prefix=None):
+        if self.use_flash_attention:
+            _, _, _, attention_out = self.flash_attention(query, key, value, real_shift, drop_mask, padding_mask,
+                                                          attn_mask, prefix)
+            if self.input_layout == "BNSD":
+                attention_out = self._merge_heads(attention_out)
+        else:
+            attention_out = self._attn(query, key, value, attn_mask)
+        return attention_out
+
+    def _merge_heads(self, x):
+        """
+        convert a 4d input to a 2d or 3d output
+
+        Inputs:
+            x: input tensor
+
+        Output:
+            x_merge: the 2d output
+        """
+        # [bs, n_head, seq/1, head_dim]
+        x = self.merger_head_transpose(x, (0, 2, 1, 3))  # dp,mp,1,1 -> dp,1,mp,1
+        # [bs, seq/1, n_head, head_dim]
+        bs, seq_len, n_head, head_dim = self.shape(x)
+        # [bs, seq/1, hidden_dim]
+        new_shape = (bs, seq_len, n_head * head_dim)
+        x_merge = self.reshape(x, new_shape)
+        return x_merge
+
+    def _attn(self, query, key, value, mask):
+        """
+        Get the weighted score along the seq_length
+
+        Inputs:
+            query: the query matrix
+            key: the key matrix
+            value: the value matrix
+            mask: the attention mask adder matrix with shape (batch_size,
+            1, seq_length, seq_length)
+        Outputs:
+            weighted_values: Tensor, the weighted sum scores
+        """
+        # q, k: [bs, n_head, seq/1, head_dim], [bs, n_head, seq, head_dim]
+        score = self.batch_matmul_q_k(query, key)
+        # score: [bs, n_head, seq/1, seq]
+        if self.input_layout == "BNSD":
+            _, _, _, head_dim = self.shape(query)
+        else:
+            _, _, h_size = self.shape(query)
+            head_dim = h_size // self.head_num
+        scale = Tensor(1.0 / math.sqrt(head_dim), dtype=self.dtype)
+        score = self.mul(score, scale)
+        score = self.add(mask, score)
+
+        attention_probs = self.softmax(self.cast_attn(score, self.softmax_dtype))
+        # score, v: [bs, n_head, seq/1, seq], [bs, n_head, seq, head_dim]
+        weighted_values = self.batch_matmul(self.cast(attention_probs, self.dtype), value)
+        # [bs, n_head, seq/1, head_dim]
+        attention_merge = self._merge_heads(weighted_values)
+        # [bs, seq/1, hidden_dim] or [bs * seq/1, hidden_dim]
+        return attention_merge
+
+    def shard(self, parallel_config):
+        dp = parallel_config.data_parallel
+        mp = parallel_config.model_parallel
+        self.flash_attention.shard(((dp, 1, mp), (dp, 1, mp), (dp, 1, mp)))

@@ -13,6 +13,7 @@
 # limitations under the License.
 # ============================================================================
 """ChatGLM2 model."""
+import mindspore as ms
 import mindspore.ops as ops
 import mindspore.common.dtype as mstype
 import mindspore.ops.operations as P
@@ -32,7 +33,8 @@ from mindformers.models.modeling_utils import PreTrainedModel
 from ..utils import cell_reuse
 from .glm2_config import ChatGLM2Config
 from .glm2_modules import precompute_rotary_emb_cache
-from .glm2_transformer import ChatGLM2Transformer
+from .glm2_transformer import ChatGLM2Transformer, ChatGLM2TransformerKBKInfer
+from ...tools.logger import logger
 
 __all__ = ['ChatGLM2ForConditionalGeneration', 'ChatGLM2Model', 'ChatGLM2WithPtuning2']
 
@@ -54,6 +56,7 @@ class ChatGLM2Model(GLM2PreTrainedModel):
     Args:
         config (GLMConfig): The config of network.
     """
+
     def __init__(self, config: ChatGLM2Config, **kwargs):
         super(ChatGLM2Model, self).__init__(config, **kwargs)
         self.num_layers = config.num_layers
@@ -72,17 +75,21 @@ class ChatGLM2Model(GLM2PreTrainedModel):
                                         parallel_config=embed_parallel_config)
         self.embedding.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
 
-        # rotary embedding
-        rotary_dim = (
-            config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
-        )
-        self.rotary_pos_emb = precompute_rotary_emb_cache(
-            seq_len=self.seq_length,
-            dim=rotary_dim // 2
-        )
-        self.rotary_pos_emb = Tensor(self.rotary_pos_emb, config.compute_dtype)
-
-        self.encoder = ChatGLM2Transformer(config)
+        self.use_kbk_infer = config.use_kbk_infer
+        if self.use_kbk_infer:
+            logger.info("Enable kbk infer.")
+            self.encoder = ChatGLM2TransformerKBKInfer(config)
+        else:
+            self.encoder = ChatGLM2Transformer(config)
+            # rotary embedding
+            rotary_dim = (
+                config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
+            )
+            self.rotary_pos_emb = precompute_rotary_emb_cache(
+                seq_len=self.seq_length,
+                dim=rotary_dim // 2
+            )
+            self.rotary_pos_emb = Tensor(self.rotary_pos_emb, config.compute_dtype)
 
         self.output_layer = Linear(config.hidden_size,
                                    config.vocab_size,
@@ -94,7 +101,6 @@ class ChatGLM2Model(GLM2PreTrainedModel):
         if config.parallel_config.pipeline_stage > 1:
             self.output_layer.pipeline_stage = config.parallel_config.pipeline_stage - 1
         self.output_layer.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
-
 
         self.tril = get_tril()
         self.ones = P.Ones()
@@ -118,37 +124,43 @@ class ChatGLM2Model(GLM2PreTrainedModel):
         attention_mask = self.less(low_triangle, 0.5)
         if self.use_past and not self.is_first_iteration:
             # [bs, 1, seq_len] for incremental infer
-            attention_mask = self.gather(attention_mask.view(-1, self.seq_length), input_position, 0)
+            attention_mask = self.cast(attention_mask.view(-1, self.seq_length), mstype.int8)
+            attention_mask = self.gather(attention_mask, input_position, 0)
         # [bs, 1, seq_len, seq_len] for normal, [bs, 1, 1, seq_len] for incremental infer
         attention_mask = self.reshape(attention_mask, (batch_size, 1, -1, self.seq_length))
         return attention_mask
 
     def construct(self, input_ids, input_position=None, position_ids=None, attention_mask=None,
                   input_embeds=None, init_reset=True, batch_valid_length=None, full_attention_mask=None,
-                  prefix_key_values=None):
+                  prefix_key_values=None, block_tables=None, slot_mapping=None):
         """ChatGLM2 model."""
         _ = position_ids
         batch_size, _ = input_ids.shape
         if input_embeds is None:
             input_embeds, _ = self.embedding(input_ids)  # (bs, seq_len, hs)
 
-        if full_attention_mask is None:
+        if full_attention_mask is None and not self.use_kbk_infer:
             # (bs, 1, seq_len, seq_len)
             full_attention_mask = self.get_masks(batch_size, attention_mask, input_position)
 
         # (sen length, kv_channels // 4, 2)
-        rotary_pos_emb = self.rotary_pos_emb
-        if self.use_past and not self.is_first_iteration and batch_valid_length is not None:
-            # only take [bs, 1, kv_channels // 4, 2]
-            batch_gather_position = batch_valid_length.view(-1, 1) - 1  # [bs, seq_len=1]
-            rotary_pos_emb = self.gather(rotary_pos_emb, batch_gather_position, 0)
+        if not self.use_kbk_infer:
+            rotary_pos_emb = self.rotary_pos_emb
+            if self.use_past and not self.is_first_iteration and batch_valid_length is not None:
+                # only take [bs, 1, kv_channels // 4, 2]
+                batch_gather_position = batch_valid_length.view(-1, 1) - 1  # [bs, seq_len=1]
+                rotary_pos_emb = self.gather(rotary_pos_emb, batch_gather_position, 0)
 
         # Run encoder.
-        hidden_states = self.encoder(
-            input_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb,
-            init_reset=init_reset, batch_valid_length=batch_valid_length,
-            prefix_key_values=prefix_key_values)
-
+        if self.use_kbk_infer:
+            hidden_states = self.encoder(
+                input_embeds, batch_valid_length=batch_valid_length,
+                block_tables=block_tables, slot_mapping=slot_mapping)
+        else:
+            hidden_states = self.encoder(
+                input_embeds, full_attention_mask, rotary_pos_emb=rotary_pos_emb,
+                init_reset=init_reset, batch_valid_length=batch_valid_length,
+                prefix_key_values=prefix_key_values)
         return hidden_states
 
 
@@ -194,8 +206,19 @@ class ChatGLM2ForConditionalGeneration(GLM2PreTrainedModel):
             "input_position": input_position
         }
 
+    def set_dynamic_inputs(self):
+        dynamic_input_ids = Tensor(shape=[None, None], dtype=ms.int32)
+        dynamic_batch_valid_length = Tensor(shape=[None, None], dtype=ms.int64)
+        dynamic_block_tables = Tensor(shape=[None, None], dtype=ms.uint64)
+        dynamic_slot_mapping = Tensor(shape=[None], dtype=ms.int32)
+        self.set_inputs(dynamic_input_ids, None, None, None, None,
+                        None, True, dynamic_batch_valid_length, None,
+                        dynamic_block_tables, dynamic_slot_mapping)
+        logger.info("Set dynamic input for glm.")
+
     def construct(self, input_ids=None, labels=None, input_position=None, position_ids=None, attention_mask=None,
-                  input_embeds=None, init_reset=True, batch_valid_length=None, prefix_key_values=None):
+                  input_embeds=None, init_reset=True, batch_valid_length=None, prefix_key_values=None,
+                  block_tables=None, slot_mapping=None):
         """ChatGLM2 for conditional generation model."""
         # input_ids: (bs, seq_len)
         # position_ids: (bs, seq_len)
@@ -209,7 +232,9 @@ class ChatGLM2ForConditionalGeneration(GLM2PreTrainedModel):
             input_embeds=input_embeds,
             init_reset=init_reset,
             batch_valid_length=batch_valid_length,
-            prefix_key_values=prefix_key_values
+            prefix_key_values=prefix_key_values,
+            block_tables=block_tables,
+            slot_mapping=slot_mapping
         )
         lm_logits = self.transformer.output_layer(hidden_states)
         outputs = (lm_logits,)
@@ -294,7 +319,8 @@ class ChatGLM2WithPtuning2(ChatGLM2ForConditionalGeneration):
         PetAdapter.freeze_pretrained_model(self, config.pet_config.pet_type)
 
     def construct(self, input_ids=None, labels=None, input_position=None, position_ids=None, attention_mask=None,
-                  input_embeds=None, init_reset=True, batch_valid_length=None, prefix_key_values=None):
+                  input_embeds=None, init_reset=True, batch_valid_length=None, prefix_key_values=None,
+                  block_tables=None, slot_mapping=None):
 
         if not self.use_past or self.is_first_iteration:
             batch_size = input_ids.shape[0]

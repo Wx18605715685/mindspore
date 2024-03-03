@@ -1151,6 +1151,14 @@ def fizzbuzz(n):
 
 ---
 
+### 训推一体KBK推理
+
+#### 单卡推理
+
+```bash
+python run_mindformer.py --config configs/llama/run_llama_7b_910b_kbk_infer_pynative.yaml --run_mode predict --predict_data 'I love Beijing, because' --use_parallel False
+```
+
 ## [mindspore-lite](../feature_cards/Inference.md)
 
 如需导出模型，使用mindspore-lite进行离线推理请参考[推理特性使用文档](../feature_cards/Inference.md)

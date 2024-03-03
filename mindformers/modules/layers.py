@@ -23,7 +23,9 @@ import inspect
 import math
 import numpy as np
 
+import mindspore as ms
 from mindspore import nn
+from mindspore import ops
 from mindspore.common.parameter import Parameter
 from mindspore.common.initializer import initializer, Tensor
 import mindspore.common.dtype as mstype
@@ -32,6 +34,7 @@ from mindspore.nn.cell import Cell
 from mindspore.ops import functional as F
 from mindspore.ops import operations as P
 from mindspore.ops.primitive import constexpr
+
 # MindSpore 2.0 has changed the APIs of _checkparam, the following try except is for compatibility
 try:
     from mindspore._checkparam import Validator
@@ -48,7 +51,8 @@ __all__ = [
     "FixedSparseAttention",
     "Dropout",
     "LayerNorm",
-    "Linear"
+    "Linear",
+    "LinearQkv"
 ]
 
 
@@ -284,7 +288,7 @@ class LayerNorm(Cell):
     def __init__(self, normalized_shape, eps=1e-5, param_init_type=mstype.float32, is_self_defined=False):
         super(LayerNorm, self).__init__()
         if param_init_type not in [mstype.float32, mstype.float16, mstype.bfloat16]:
-            raise TypeError("The type of parameter 'param_init_type' should in [float32, float16], "
+            raise TypeError("The type of parameter 'param_init_type' should in [float32, float16, bfloat16], "
                             "but got the type : {}.".format(type(param_init_type)))
         # Since the mindspore 1.10 version, the layernorm has been changed to P.LayerNorm
         self.is_self_defined = is_self_defined
@@ -789,6 +793,7 @@ class FixedSparseAttention(nn.Cell):
 
         return q, k, v
 
+
 class AlibiTensor(nn.Cell):
     """
     Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
@@ -837,19 +842,19 @@ class AlibiTensor(nn.Cell):
             extra_powers = np.arange(1, 1 + 2 * num_remaining_heads, 2, dtype=np.int32)
             slopes = np.concatenate([slopes, np.power(extra_base, extra_powers)], axis=0)
 
-        self.slopes = Tensor(slopes[:, None], mstype.float32) # (num_heads, 1)
+        self.slopes = Tensor(slopes[:, None], mstype.float32)  # (num_heads, 1)
 
     def construct(self, attention_mask, dtype):
         """
         Note: alibi will added to the attention bias that will be applied to the query, key product of attention
         therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
         """
-        arange_tensor = self.cumsum(attention_mask, -1) # (batch_size, seq_len)
-        arange_tensor = self.add(arange_tensor, self.minus_one) # (batch_size, seq_len)
-        arange_tensor = self.mul(arange_tensor, attention_mask) # (batch_size, seq_len)
-        arange_tensor = self.expand_2d(arange_tensor, 1) # (batch_size, 1, seq_len)
-        alibi = self.mul_slope(self.slopes, arange_tensor) # (batch_size, num_heads, seq_len)
-        alibi = self.expand_3d(alibi, 2).astype(dtype) # (batch_size, num_heads, 1, seq_len)
+        arange_tensor = self.cumsum(attention_mask, -1)  # (batch_size, seq_len)
+        arange_tensor = self.add(arange_tensor, self.minus_one)  # (batch_size, seq_len)
+        arange_tensor = self.mul(arange_tensor, attention_mask)  # (batch_size, seq_len)
+        arange_tensor = self.expand_2d(arange_tensor, 1)  # (batch_size, 1, seq_len)
+        alibi = self.mul_slope(self.slopes, arange_tensor)  # (batch_size, num_heads, seq_len)
+        alibi = self.expand_3d(alibi, 2).astype(dtype)  # (batch_size, num_heads, 1, seq_len)
         return alibi
 
 
@@ -904,7 +909,7 @@ class AlibiTensorV2(nn.Cell):
             extra_powers = np.arange(1, 1 + 2 * num_remaining_heads, 2, dtype=np.int32)
             slopes = np.concatenate([slopes, np.power(extra_base, extra_powers)], axis=0)
 
-        self.slopes = Tensor(slopes[None, :, None, None], mstype.float32) # (num_heads, 1)
+        self.slopes = Tensor(slopes[None, :, None, None], mstype.float32)  # (num_heads, 1)
 
     def construct(self, attention_mask, dtype=mstype.float32):
         """
@@ -912,16 +917,18 @@ class AlibiTensorV2(nn.Cell):
         therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
         """
         bs, seqlen = attention_mask.shape
-        arange_tensor = self.cumsum(attention_mask, -1) # (batch_size, seq_len)
-        max_pos = -arange_tensor[:, -1:] # (batch_size, 1)
-        arange_tensor = self.add_2d(arange_tensor, max_pos) # (batch_size, seq_len)
-        arange_tensor = self.expand_2d(arange_tensor, 1) # (batch_size, 1, seq_len)
-        diag = -self.transpose(arange_tensor, (0, 2, 1)) # (batch_size, seq_len, 1)
-        arange_tensor = self.add_3d(arange_tensor, diag)    # (batch_size, seq_len, seq_len)
-        arange_tensor = self.expand_3d(arange_tensor, 1) # (batch_size, 1, seq_len, seq_len)
-        alibi = self.mul_slope(self.slopes, arange_tensor) # (batch_size, num_heads, seq_len, seq_len)
-        alibi_mask = self.mul_mask(alibi, self.reshape(attention_mask, (bs, 1, seqlen, 1))) # (batch_size, num_heads, seq_len, seq_len)
-        alibi_mask = self.mul_mask(alibi_mask, self.reshape(attention_mask, (bs, 1, 1, seqlen))) # (batch_size, num_heads, seq_len, seq_len)
+        arange_tensor = self.cumsum(attention_mask, -1)  # (batch_size, seq_len)
+        max_pos = -arange_tensor[:, -1:]  # (batch_size, 1)
+        arange_tensor = self.add_2d(arange_tensor, max_pos)  # (batch_size, seq_len)
+        arange_tensor = self.expand_2d(arange_tensor, 1)  # (batch_size, 1, seq_len)
+        diag = -self.transpose(arange_tensor, (0, 2, 1))  # (batch_size, seq_len, 1)
+        arange_tensor = self.add_3d(arange_tensor, diag)  # (batch_size, seq_len, seq_len)
+        arange_tensor = self.expand_3d(arange_tensor, 1)  # (batch_size, 1, seq_len, seq_len)
+        alibi = self.mul_slope(self.slopes, arange_tensor)  # (batch_size, num_heads, seq_len, seq_len)
+        alibi_mask = self.mul_mask(alibi, self.reshape(attention_mask,
+                                                       (bs, 1, seqlen, 1)))  # (batch_size, num_heads, seq_len, seq_len)
+        alibi_mask = self.mul_mask(alibi_mask, self.reshape(attention_mask, (
+            bs, 1, 1, seqlen)))  # (batch_size, num_heads, seq_len, seq_len)
         return alibi_mask.astype(dtype)
 
     def shard(self, parallel_config):
@@ -940,8 +947,37 @@ class AlibiTensorV2(nn.Cell):
         self.mul_mask.shard(((dp, mp, 1, 1), (dp, 1, 1, 1)))
 
 
+class RotaryEmbedding(nn.Cell):
+    """Rotary Embedding."""
+
+    def __init__(self, dim, base=10000, max_seq_len=2048, cos_format=0):
+        super(RotaryEmbedding, self).__init__()
+        inv_freq = 1.0 / (base ** (np.arange(0, dim, 2).astype(np.float16) * (1 / dim)))
+        t = np.arange(max_seq_len, dtype=inv_freq.dtype)
+        freqs = np.outer(t, inv_freq)
+        if cos_format == 0:
+            emb = np.concatenate((freqs, freqs), axis=-1)
+        else:
+            freqs = np.expand_dims(freqs, 2)
+            emb = np.concatenate((freqs, freqs), axis=-1)
+            emb = emb.reshape(max_seq_len, dim)
+        self.cos = Tensor(np.cos(emb), dtype=ms.float16)
+        self.sin = Tensor(np.sin(emb), dtype=ms.float16)
+        self.apply_rotary_pos_emb = ops.ApplyRotaryPosEmb(cos_format)
+
+    def construct(self, query, key, position_ids):
+        query_embed, key_embed = self.apply_rotary_pos_emb(query, key, self.cos, self.sin, position_ids)
+        return query_embed, key_embed
+
+    def shard(self, parallel_config):
+        dp = parallel_config.data_parallel
+        mp = parallel_config.model_parallel
+        self.apply_rotary_pos_emb.shard(((dp, 1, mp), (dp, 1, mp), (1, 1), (1, 1), (dp,)))
+
+
 def _get_interleave(n):
     """calculate slopes of alibi tensor"""
+
     def _get_interleave_power_of_2(n):
         start = (2 ** (-2 ** -(math.log2(n) - 3)))
         ratio = start
@@ -957,8 +993,8 @@ def _get_interleave(n):
 
 def build_alibi_tensor_v2(seq_len, num_heads, return_tensors='ms', dtype=mstype.float32):
     """build alibi tensor"""
-    assert return_tensors in ['np', 'ms'],\
-           f"return tensors must be 'np' or 'ms', {return_tensors} not support."
+    assert return_tensors in ['np', 'ms'], \
+        f"return tensors must be 'np' or 'ms', {return_tensors} not support."
     slopes = _get_interleave(num_heads)
     slopes = np.expand_dims(np.expand_dims(slopes, 1), 1)
     position_point = np.arange(seq_len) - seq_len + 1
@@ -973,3 +1009,186 @@ def build_alibi_tensor_v2(seq_len, num_heads, return_tensors='ms', dtype=mstype.
     if return_tensors == 'np':
         return alibi
     return Tensor(alibi, dtype=dtype)
+
+
+class LinearQkv(Cell):
+    r"""
+    The dense connected layer for computing qkv at the same time. Once the parallel mode is enabled,
+    the input shape should be 3-D tensor.
+    Applies dense connected layer for the input. This layer implements the operation as:
+
+    .. math::
+        \text{outputs_q} = \text{activation}(\text{X} * \text{kernel_} + \text{bias}),
+
+    where :math:`X` is the input tensors, :math:`\text{activation}` is the activation function passed as the activation
+    argument (if passed in), :math:`\text{kernel}` is a weight matrix with the same
+    data type as the :math:`X` created by the layer, and :math:`\text{bias}` is a bias vector
+    with the same data type as the :math:`X` created by the layer (only if has_bias is True).
+
+    Args:
+        in_channels (int): The number of channels in the input space.
+        out_channels_q (int): The number of channels of query in the output space.
+        out_channels_k (int): The number of channels of key in the output space.
+        out_channels_v (int): The number of channels of value in the output space.
+        weight_init_q (Union[Tensor, str, Initializer, numbers.Number]): The trainable weight_init_q parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'normal'.
+        weight_init_k (Union[Tensor, str, Initializer, numbers.Number]): The trainable weight_init_k parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'normal'.
+        weight_init_v (Union[Tensor, str, Initializer, numbers.Number]): The trainable weight_init_v parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'normal'.
+        bias_init_q (Union[Tensor, str, Initializer, numbers.Number]): The trainable bias_init_q parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'zeros'.
+        bias_init_k (Union[Tensor, str, Initializer, numbers.Number]): The trainable bias_init_k parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'zeros'.
+        bias_init_v (Union[Tensor, str, Initializer, numbers.Number]): The trainable bias_init_v parameter.
+            The dtype is same as `x`. The values of str refer to the function `initializer`. Default: 'zeros'.
+        has_bias (bool): Specifies whether the layer uses a bias vector. Default: True.
+        activation (str): activate function applied to the output of the fully connected layer,
+            eg. 'ReLU'. Default: None.
+        expert_num (int): The number of experts used in this Linear. Number > 1 is not supported yet. Default: 1.
+        outer_batch (int): The replication number of experts. The replication is effective only when MoE is applied.
+            Default: 1.
+        expert_group_size (int): The number of tokens in each data parallel group. Default: None.
+        compute_dtype (dtype.Number): The computation type. Default: mstype.float16
+    Inputs:
+        - **x** (Tensor) - Tensor of shape :math:`(*, in\_channels)`. The `in_channels` in `Args` should be equal
+          to :math:`in\_channels` in `Inputs`.
+
+    Outputs:
+        Tuple of Tensor (output_q, output_k, output_v), and the shapes are math:`(*, out\_channels_q)`,
+        math:`(*, out\_channels_k)`, math:`(*, out\_channels_v)`.
+
+    Raises:
+        TypeError: If `in_channels` or `out_channels` is not an int.
+        TypeError: If `has_bias` is not a bool.
+        TypeError: If `activation` is not one of str, Cell, Primitive, None.
+        ValueError: If length of shape of `weight_init_q` is not equal to 2 or shape[0] of `weight_init_q`
+                    is not equal to `out_channels_q` or shape[1] of `weight_init_q` is not equal to `in_channels`.
+                    The same as `weight_init_k` and `weight_init_v`.
+        ValueError: If length of shape of `bias_init_q` is not equal to 1
+                    or shape[0] of `bias_init_q` is not equal to `out_channels_q`.
+                    The same as `bias_init_k` and `bias_init_v`.
+
+    Supported Platforms:
+        ``Ascend``
+    """
+
+    @cell_attr_register
+    @_args_type_validator_check(in_channels=Validator.check_positive_int,
+                                out_channels_q=Validator.check_positive_int,
+                                out_channels_k=Validator.check_positive_int,
+                                out_channels_v=Validator.check_positive_int,
+                                has_bias=Validator.check_bool,
+                                transpose_b=Validator.check_bool,
+                                expert_num=Validator.check_positive_int,
+                                outer_batch=Validator.check_positive_int,
+                                param_init_type=_valid_value_checks([mstype.float32, mstype.float16, mstype.bfloat16],
+                                                                    "Linear"),
+                                compute_dtype=_valid_value_checks([mstype.float32, mstype.float16, mstype.bfloat16],
+                                                                  "Linear"))
+    def __init__(self,
+                 in_channels,
+                 out_channels_q,
+                 out_channels_k,
+                 out_channels_v,
+                 weight_init_q='normal',
+                 weight_init_k='normal',
+                 weight_init_v='normal',
+                 bias_init_q='zeros',
+                 bias_init_k='zeros',
+                 bias_init_v='zeros',
+                 has_bias=True,
+                 activation=None,
+                 transpose_b=True,
+                 expert_num=1,
+                 outer_batch=1,
+                 expert_group_size=None,
+                 param_init_type=mstype.float32,
+                 compute_dtype=mstype.float16,
+                 skip_redistribution=False):
+        super(LinearQkv, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels_qkv = [out_channels_q, out_channels_k, out_channels_v]
+        if not (isinstance(activation, str) or activation is None or issubclass(activation, nn.Cell)):
+            raise TypeError(
+                f"For LinearQkv cell, the activation should be str type or nn.Cell type, but got {activation}.")
+        if isinstance(weight_init_q, Tensor) and (weight_init_q.ndim != 2 or weight_init_q.shape[0] != out_channels_q or
+                                                  weight_init_q.shape[1] != in_channels):
+            raise ValueError("The shape of parameter 'weight_init_q' is error, please check shape of 'weight_init_q'.")
+        if isinstance(weight_init_k, Tensor) and (weight_init_k.ndim != 2 or weight_init_k.shape[0] != out_channels_k or
+                                                  weight_init_k.shape[1] != in_channels):
+            raise ValueError("The shape of parameter 'weight_init_k' is error, please check shape of 'weight_init_k'.")
+        if isinstance(weight_init_v, Tensor) and (weight_init_v.ndim != 2 or weight_init_v.shape[0] != out_channels_v or
+                                                  weight_init_v.shape[1] != in_channels):
+            raise ValueError("The shape of parameter 'weight_init_v' is error, please check shape of 'weight_init_v'.")
+        self.expert_num = expert_num
+        self.outer_batch = outer_batch
+        self.expert_group_size = expert_group_size
+        self.transpose_b = transpose_b
+        self.weight_q = None
+        self.weight_k = None
+        self.weight_v = None
+        if self.expert_num > 1:
+            self.expert_flag = True
+        else:
+            self.expert_flag = False
+            wq_shape = [out_channels_q, in_channels] if transpose_b else [in_channels, out_channels_q]
+            wk_shape = [out_channels_k, in_channels] if transpose_b else [in_channels, out_channels_k]
+            wv_shape = [out_channels_v, in_channels] if transpose_b else [in_channels, out_channels_v]
+            self.weight_q = Parameter(initializer(weight_init_q, wq_shape, param_init_type), name="weight_q")
+            self.weight_k = Parameter(initializer(weight_init_k, wk_shape, param_init_type), name="weight_k")
+            self.weight_v = Parameter(initializer(weight_init_v, wv_shape, param_init_type), name="weight_v")
+            self.matmul = P.MatmulQkv()
+        self.use_expert_group_size = _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) \
+                                     and not _is_sharding_propagation() and self.expert_flag is True
+        if self.use_expert_group_size is True and self.expert_group_size is None:
+            raise ValueError("'expert_group_size' should be configured as an integer in MoEConfig.")
+        self.has_bias = has_bias
+        self.bias_q = None
+        self.bias_k = None
+        self.bias_v = None
+        if self.has_bias:
+            self.bias_q = Parameter(initializer(bias_init_q, [out_channels_q], param_init_type), name="bias_q")
+            self.bias_k = Parameter(initializer(bias_init_k, [out_channels_k], param_init_type), name="bias_k")
+            self.bias_v = Parameter(initializer(bias_init_v, [out_channels_v], param_init_type), name="bias_v")
+            self.bias_add = P.Add()
+        self.act_name = activation
+        if callable(activation):
+            self.activation = activation()
+        else:
+            self.activation = get_activation(activation) if isinstance(activation, str) else activation
+        self.activation_flag = self.activation is not None
+        self.dtype = compute_dtype
+        self.cast = P.Cast()
+        self.reshape = P.Reshape()
+        if skip_redistribution:
+            self.reshape.add_prim_attr("skip_redistribution", True)
+        self.shape = P.Shape()
+
+    def construct(self, x):
+        """Forward process, x should be a tensor"""
+        ori_x_shape = self.shape(x)[:-1]
+        x = self.reshape(x, (-1, self.in_channels))
+        if self.expert_flag:
+            if self.use_expert_group_size is True:
+                x = self.reshape(x, (-1, self.expert_num, self.expert_group_size, self.in_channels))
+            else:
+                x = self.reshape(x, (self.outer_batch, self.expert_num, -1, self.in_channels))
+        ori_dtype = F.dtype(x)
+        x = self.cast(x, self.dtype)
+        weight_q = self.cast(self.weight_q, self.dtype)
+        weight_k = self.cast(self.weight_k, self.dtype)
+        weight_v = self.cast(self.weight_v, self.dtype)
+        output_qkv = self.matmul(x, weight_q, weight_k, weight_v)
+        output_list = []
+        bias_list = [self.bias_q, self.bias_k, self.bias_v]
+        for _, (out, bias, o_channel) in enumerate(zip(output_qkv, bias_list, self.out_channels_qkv)):
+            if self.has_bias:
+                out = self.bias_add(out, self.cast(bias, self.dtype))
+            if self.activation_flag:
+                out = self.activation(out)
+            out = F.cast(out, ori_dtype)
+            out_shape = ori_x_shape + (o_channel,)
+            out = self.reshape(out, out_shape)
+            output_list.append(out)
+        return output_list

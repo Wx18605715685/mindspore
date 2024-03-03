@@ -14,8 +14,8 @@
 # ============================================================================
 """ChatGLM2 Transformer."""
 import math
-import numpy as np
 
+import numpy as np
 import mindspore.ops.functional as F
 import mindspore.ops.operations as P
 from mindspore import Parameter, Tensor, nn, ops
@@ -40,7 +40,10 @@ except ImportError:
 from mindformers.modules import LayerNorm
 from mindformers.modules.layers import Linear
 from mindformers.pet.tuners.ptuning2_adapter import Ptuning2Adapter
-from mindformers.version_control import get_dropout, check_valid_flash_attention, choose_flash_attention_dtype
+from mindformers.version_control import get_dropout, choose_flash_attention_dtype, check_valid_flash_attention
+from mindformers.modules import PagedAttentionMgr
+from mindformers.modules.layers import RotaryEmbedding
+from mindformers.modules.transformer import FlashAttentionScore
 
 from .glm2_config import ChatGLM2Config
 from .glm2_modules import ChatGLM2MLP, ChatGLM2RMSNorm
@@ -48,6 +51,7 @@ from .glm2_modules import ChatGLM2MLP, ChatGLM2RMSNorm
 
 class CoreAttention(nn.Cell):
     """ChatGLM2 core attention."""
+
     def __init__(self, config: ChatGLM2Config, layer_number):
         super(CoreAttention, self).__init__()
         self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
@@ -156,6 +160,7 @@ class CoreAttention(nn.Cell):
 
 class ChatGLM2SelfAttention(nn.Cell):
     """ChatGLM2 self-attention."""
+
     def __init__(self, config: ChatGLM2Config, layer_number):
         super(ChatGLM2SelfAttention, self).__init__()
         self.layer_number = max(1, layer_number)
@@ -254,6 +259,7 @@ class ChatGLM2SelfAttention(nn.Cell):
                                                              input_layout='BNSD',
                                                              num_key_value_heads=0)
         self.merger_head_transpose = P.Transpose().shard(((dp, mp, 1, 1),))
+
     def _merge_heads(self, x):
         """
         convert a 4d input to a 2d output
@@ -374,7 +380,6 @@ class ChatGLM2SelfAttention(nn.Cell):
             query_layer = self.apply_rotary_pos_emb(query_layer, rotary_pos_emb)
             # [bs, multi_query_groups, seq_len, hidden_size_per_attention_head]
             key_layer = self.apply_rotary_pos_emb(key_layer, rotary_pos_emb)
-
         key_layer, value_layer, attention_mask = self.add_prefix_if_need(
             prefix_key_value,
             key_layer,
@@ -441,7 +446,7 @@ class ChatGLM2SelfAttention(nn.Cell):
 
         if not self.training:
             if self.use_prompt_flash_attention and \
-               ((self.use_past and self.is_first_iteration) or (not self.use_past)):
+                    ((self.use_past and self.is_first_iteration) or (not self.use_past)):
                 attention_mask = attention_mask.squeeze(1).to(self.attention_mask_dtype)
                 context_layer = self.prompt_flash_attention(query_layer, key_layer, value_layer, attention_mask,
                                                             None, None, None, None, None, None, None, None)
@@ -492,7 +497,6 @@ class ChatGLM2Block(nn.Cell):
         # Layernorm on the input data.
         self.input_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
                                                param_init_type=self.layernorm_dtype)
-
         self.input_layernorm.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
 
         # Self attention.
@@ -603,6 +607,264 @@ class ChatGLM2Block(nn.Cell):
         # add dependency for desired execution order
         mlp_output = F.depend(mlp_output, value_update)
         mlp_output = F.depend(mlp_output, key_update)
+
+        # Second residual connection.
+        # False on default.
+        if self.apply_residual_connection_post_layernorm:
+            residual = layernorm_output
+        else:
+            residual = layernorm_input
+
+        output = self.dropout(mlp_output)
+        output = residual + output
+
+        return output
+
+
+class ChatGLM2SelfAttentionKBKInfer(nn.Cell):
+    """ChatGLM2 self-attention."""
+
+    def __init__(self, config: ChatGLM2Config, layer_number):
+        super(ChatGLM2SelfAttentionKBKInfer, self).__init__()
+        self.layer_number = max(1, layer_number)
+
+        self.projection_size = config.kv_channels * config.num_attention_heads
+        # Per attention head and per partition values.
+        self.hidden_size_per_attention_head = self.projection_size // config.num_attention_heads
+        self.num_attention_heads_per_partition = config.num_attention_heads
+        self.params_dtype = config.param_init_type
+        self.compute_dtype = config.compute_dtype
+        self.batch_size = config.batch_size
+        self.seq_length = config.seq_length
+
+        self.multi_query_attention = config.multi_query_attention
+        self.qkv_hidden_size = 3 * self.projection_size
+        self.block_size = config.block_size
+        self.num_blocks = config.num_blocks
+        self.use_kbk_infer = config.use_kbk_infer
+        if self.multi_query_attention:
+            self.num_multi_query_groups_per_partition = config.multi_query_group_num
+            self.qkv_hidden_size = (
+                self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num)
+
+        parallel_config = config.parallel_config
+
+        self.query_key_value = Linear(config.hidden_size,
+                                      self.qkv_hidden_size,
+                                      has_bias=config.add_bias_linear or config.add_qkv_bias,
+                                      param_init_type=self.params_dtype,
+                                      compute_dtype=self.compute_dtype)
+        self.query_key_value.shard(strategy_matmul=((parallel_config.data_parallel, 1),
+                                                    (parallel_config.model_parallel, 1)),
+                                   strategy_bias=((parallel_config.data_parallel, parallel_config.model_parallel),
+                                                  (parallel_config.model_parallel,))
+                                   )
+
+        self.dense = Linear(self.projection_size,
+                            config.hidden_size,
+                            has_bias=config.add_bias_linear,
+                            param_init_type=self.params_dtype,
+                            compute_dtype=self.compute_dtype)
+        self.dense.shard(strategy_matmul=((parallel_config.data_parallel, 1),
+                                          (parallel_config.model_parallel, 1)),
+                         strategy_bias=((parallel_config.data_parallel, 1), (1,)))
+
+        self.split_3 = P.Split(axis=-1, output_num=3)
+
+        self.is_first_iteration = True
+        self.paged_attention_mgr = PagedAttentionMgr(config.num_attention_heads,
+                                                     config.hidden_size // config.num_attention_heads,
+                                                     config.hidden_size,
+                                                     n_kv_heads=config.multi_query_group_num,
+                                                     block_size=self.block_size,
+                                                     num_blocks=self.num_blocks,
+                                                     compute_dtype=self.compute_dtype,
+                                                     input_layout="BSH")
+        self.paged_attention_mgr.shard(parallel_config)
+
+        self.flash_attention_score = FlashAttentionScore(head_num=config.hidden_size // config.num_attention_heads)
+        self.flash_attention_score.shard(parallel_config)
+
+        self.rotary_dim = (config.hidden_size // config.num_attention_heads if
+                           config.kv_channels is None else config.kv_channels)
+        self.rotary_pos_emb = RotaryEmbedding(dim=self.rotary_dim // 2, base=1000, max_seq_len=config.seq_length,
+                                              cos_format=1)
+        self.rotary_pos_emb.shard(parallel_config)
+        self.context_position_ids = Tensor(np.arange(config.seq_length), dtype=mstype.int64)
+        self.split_rope = P.Split(axis=-1, output_num=2)
+        self.concat = P.Concat(axis=-1)
+
+    def apply_rotary_pos_emb_kbk_infer(self, query: Tensor, key: Tensor, position_ids):
+        """apply rotary pos emb kbk infer."""
+
+        d1 = self.rotary_dim  # D1 is 128
+        b, s, _ = query.shape
+        nq = query.shape[2] // d1
+        nk = key.shape[2] // d1
+        d2 = d1 // 2  # D2 is 64
+
+        query = query.reshape((b, s, nq, d1))
+        key = key.reshape((b, s, nk, d1))
+        # query, query_pass = query[..., 0:D2], query[..., D2:D1]
+        # key, key_pass = key[..., 0:D2], key[..., D2:D1]
+        query, query_pass = self.split_rope(query)
+        key, key_pass = self.split_rope(key)
+
+        query = query.reshape((b, s, nq * d2))
+        key = key.reshape((b, s, nk * d2))
+        query, key = self.rotary_pos_emb(query, key, position_ids)
+        query = query.reshape((b, s, nq, d2))
+        key = key.reshape((b, s, nk, d2))
+
+        query_embd = self.concat((query, query_pass)).reshape(b, s, nq * d1)
+        key_embd = self.concat((key, key_pass)).reshape(b, s, nk * d1)
+        return query_embd, key_embd
+
+    def construct(self, hidden_states, batch_valid_length=None, block_tables=None, slot_mapping=None):
+        """Forward process of self-attention."""
+        # hidden_states: [bs, seq_len, hidden_size]
+        # attention_mask (bs, 1, seq_len, seq_len)
+        # [bs, seq_len, qkv_hidden_size]
+        mixed_raw_layer = self.query_key_value(hidden_states)
+
+        # not compatible with ms below 2.0
+        if self.multi_query_attention:
+            (query_layer, key_layer, value_layer) = mixed_raw_layer.split(
+                [self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
+                 self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
+                 self.num_multi_query_groups_per_partition * self.hidden_size_per_attention_head,
+                 ],
+                axis=-1,
+            )
+        else:
+            # [b, seq, (heads * 3 * hidden_size_per_head)] --> [b, seq, heads, 3 * hidden_size_per_head]
+            new_tensor_shape = mixed_raw_layer.shape[:-1] + (
+                self.num_attention_heads_per_partition, 3 * self.hidden_size_per_attention_head,
+            )
+            mixed_raw_layer = mixed_raw_layer.view(*new_tensor_shape)
+            # [b, seq, heads, hidden_size_per_head]
+            (query_layer, key_layer, value_layer) = self.split_3(mixed_raw_layer)
+            # [b, seq, heads, hidden_size_per_head] -> [bs, num_heads, seq_len, hidden_size_per_head]
+            batch_size, seq_len, heads, hidden_size_per_head = query_layer.shape
+
+            query_layer = query_layer.view(batch_size, seq_len, heads * hidden_size_per_head)
+            key_layer = key_layer.view(batch_size, seq_len, heads * hidden_size_per_head)
+            value_layer = value_layer.view(batch_size, seq_len, heads * hidden_size_per_head)
+
+        if not self.is_first_iteration:
+            position_ids = batch_valid_length
+        else:
+            position_ids = self.context_position_ids
+        query_layer, key_layer = self.apply_rotary_pos_emb_kbk_infer(query_layer, key_layer, position_ids)
+
+        key_present = key_layer
+        value_present = value_layer
+
+        key_out = self.paged_attention_mgr(key_present, value_present, slot_mapping)
+        query_layer = ops.depend(query_layer, key_out)
+
+        if self.is_first_iteration:
+            context_layer = self.flash_attention_score(query_layer, key_layer, value_layer)
+        else:
+            context_layer = self.paged_attention_mgr.paged_attn(query_layer, batch_valid_length, block_tables)
+        # # =================
+        # # Output. [bs, seq_len, hidden_size]
+        # # =================
+
+        output = self.dense(context_layer)
+
+        return output
+
+
+class ChatGLM2BlockKBKInfer(nn.Cell):
+    """A single transformer layer with kbk infer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+    """
+
+    def __init__(self, config: ChatGLM2Config, layer_number: int):
+        super(ChatGLM2BlockKBKInfer, self).__init__()
+        self.layer_number = layer_number
+        self.apply_residual_connection_post_layernorm = config.apply_residual_connection_post_layernorm
+        self.fp32_residual_connection = config.fp32_residual_connection
+        self.params_dtype = config.param_init_type
+        self.layernorm_dtype = config.layernorm_compute_type
+        self.compute_dtype = config.compute_dtype
+        self.seq_length = config.seq_length
+        dp, _ = config.parallel_config.data_parallel, config.parallel_config.model_parallel
+
+        if config.rmsnorm:
+            layer_norm_func = ChatGLM2RMSNorm
+            # Layernorm on the input data.
+            self.input_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
+                                                   param_init_type=self.layernorm_dtype,
+                                                   use_kbk_infer=config.use_kbk_infer)
+            self.input_layernorm.shard(((dp, 1, 1),))
+
+            # Layernorm on the attention output
+            self.post_attention_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
+                                                            param_init_type=self.layernorm_dtype,
+                                                            use_kbk_infer=config.use_kbk_infer)
+            self.post_attention_layernorm.shard(((dp, 1, 1),))
+        else:
+            layer_norm_func = LayerNorm
+            # Layernorm on the input data.
+            self.input_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
+                                                   param_init_type=self.layernorm_dtype)
+            # Layernorm on the attention output
+            self.post_attention_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
+                                                            param_init_type=self.layernorm_dtype)
+
+        self.input_layernorm.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
+
+        # Self attention.
+        self.self_attention = ChatGLM2SelfAttentionKBKInfer(config, layer_number)
+        self.hidden_dropout = config.hidden_dropout
+
+        # MLP
+        self.mlp = ChatGLM2MLP(config)
+
+        self.dropout = get_dropout(self.hidden_dropout)
+        self.dropout.dropout.shard(((config.parallel_config.data_parallel, 1, 1),))
+
+        self.cast = P.Cast()
+
+    def construct(self, hidden_states, batch_valid_length=None, block_tables=None, slot_mapping=None):
+        """Forward process of the transformer layer."""
+        # hidden_states: [bs, seq_len, hidden_size]
+        # attention_mask first: (bs, 1, seq_len, seq_len), after: (bs, 1, 1, seq_len)
+
+        # Layer norm at the beginning of the transformer layer.
+        hidden_states = self.cast(hidden_states, self.layernorm_dtype)
+        layernorm_output = self.input_layernorm(hidden_states)
+        # fp32 -> fp16
+        layernorm_output = self.cast(layernorm_output, self.compute_dtype)
+
+        # Self attention.
+        attention_output = self.self_attention(
+            layernorm_output,
+            batch_valid_length,
+            block_tables,
+            slot_mapping
+        )
+
+        # Residual connection.
+        # False on default.
+        if self.apply_residual_connection_post_layernorm:
+            residual = layernorm_output
+        else:
+            residual = hidden_states
+
+        layernorm_input = self.dropout(attention_output)
+        layernorm_input = residual + layernorm_input
+
+        # Layer norm post the self attention.
+        layernorm_output = self.post_attention_layernorm(layernorm_input)
+        layernorm_output = self.cast(layernorm_output, self.compute_dtype)
+
+        # MLP.
+        mlp_output = self.mlp(layernorm_output)
 
         # Second residual connection.
         # False on default.
@@ -739,6 +1001,73 @@ class ChatGLM2Transformer(nn.Cell):
                 init_reset=init_reset,
                 batch_valid_length=batch_valid_length,
                 prefix_key_value=prefix_key_value
+            )
+
+        # Final layer norm.
+        if self.post_layer_norm:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = self.cast(hidden_states, self.compute_dtype)
+
+        return hidden_states
+
+
+class ChatGLM2TransformerKBKInfer(nn.Cell):
+    """ChatGLM2TransformerKBKInfer class."""
+
+    def __init__(self, config: ChatGLM2Config):
+        super(ChatGLM2TransformerKBKInfer, self).__init__()
+
+        self.post_layer_norm = config.post_layer_norm
+        self.compute_dtype = config.compute_dtype
+
+        # Number of layers.
+        self.num_layers = config.num_layers
+
+        self.pre_seq_len = config.pre_seq_len
+
+        # Transformer layers.
+        def build_layer(layer_number):
+            return ChatGLM2BlockKBKInfer(config, layer_number)
+
+        self.layers = nn.CellList()
+        for i in range(self.num_layers):
+            layer = build_layer(i + 1)
+            set_parallel_configure_for_layer(layer, layer_id=i, offset=0, n_layers=self.num_layers,
+                                             parallel_config=config.parallel_config,
+                                             select_recompute=config.parallel_config.recompute.select_recompute)
+            self.layers.append(layer)
+
+        dp, _ = config.parallel_config.data_parallel, config.parallel_config.model_parallel
+        if self.post_layer_norm:
+            layer_norm_func = ChatGLM2RMSNorm if config.rmsnorm else LayerNorm
+            # Final layer norm before output.
+            self.final_layernorm = layer_norm_func(config.hidden_size, eps=config.layernorm_epsilon,
+                                                   param_init_type=config.layernorm_compute_type,
+                                                   use_kbk_infer=config.use_kbk_infer)
+            # self.final_layernorm.shard()
+            self.final_layernorm.shard(((dp, 1, 1),))
+            self.final_layernorm.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
+
+    def construct(self,
+                  hidden_states,
+                  batch_valid_length=None,
+                  block_tables=None,
+                  slot_mapping=None):
+        """Forward process of the transformer."""
+        # hidden_states (bs, seq_len, hs)
+        # attention_mask (bs, 1, seq_len, seq_len)
+        # rotary_pos_emb: first: (sen length, kv_channels//2, 2)， after:[1, kv_channels // 2, 2]
+
+        if batch_valid_length is not None and isinstance(self.pre_seq_len, int):
+            batch_valid_length = batch_valid_length + self.pre_seq_len
+
+        for i in range(self.num_layers):
+            layer = self.layers[i]
+            hidden_states = layer(
+                hidden_states,
+                batch_valid_length=batch_valid_length,
+                block_tables=block_tables,
+                slot_mapping=slot_mapping
             )
 
         # Final layer norm.

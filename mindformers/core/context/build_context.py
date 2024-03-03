@@ -121,6 +121,7 @@ def init_context(use_parallel=False, context_config=None, parallel_config=None):
         rank_id = get_rank()  # local_rank
         device_num = get_group_size()  # world_size
         parallel_config.setdefault('device_num', device_num)
+        context.set_context(**context_config)
         context.reset_auto_parallel_context()
         set_strategy_save_path(parallel_config)
         context.set_auto_parallel_context(**parallel_config)

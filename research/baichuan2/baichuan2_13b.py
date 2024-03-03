@@ -34,6 +34,7 @@ from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagati
 try:
     # pylint: disable=W0611
     from mindspore.nn.layer.flash_attention import FlashAttention
+
     FLASHATTENTION_VALID = True
 except ImportError:
     FLASHATTENTION_VALID = False
@@ -53,6 +54,7 @@ from mindformers.models.llama.llama_config import LlamaConfig
 from mindformers.models.llama.llama_layer import LlamaEmbedding, LlamaFeedForward, LlamaRMSNorm
 from mindformers.tools.logger import logger
 from mindformers.version_control import check_valid_paged_attention
+from mindformers.modules.transformer import FlashAttentionScore
 
 __all__ = ['Baichuan13BV2ForCausalLM', 'Baichuan13BV2Model']
 
@@ -202,7 +204,7 @@ class Baichuan13BV2ForCausalLM(Baichuan2PreTrainedModel):
                                         dtype=ms.int32) if use_paged_attention else None
             slot_mapping = dummy_tensor(shape=[inc_mapping_len], dtype=ms.int32) if use_paged_attention else None
         return input_ids, None, None, None, None, None, None, batch_valid_length, batch_index, zactivate_len, \
-            block_tables, slot_mapping
+               block_tables, slot_mapping
 
     # pylint: disable=W0613
     def construct(self, input_ids, labels=None, input_position=None, position_ids=None, attention_mask=None,
@@ -346,6 +348,7 @@ class Baichuan13BV2Model(Baichuan2PreTrainedModel):
                                            is_flexible_shape=config.is_flexible_shape,
                                            use_flash_attention=self.use_flash_attention,
                                            use_paged_attention=config.use_paged_attention,
+                                           use_kbk_infer=config.use_kbk_infer,
                                            block_size=self.block_size,
                                            num_blocks=self.num_blocks,
                                            parallel_config=config.parallel_config)
@@ -655,7 +658,6 @@ class Baichuan13BAttention(nn.Cell):
                                               is_flexible_shape=is_flexible_shape)
                 self.kvcache_mgr.shard(parallel_config)
 
-
     # pylint: disable=W0613
     def construct(self, x: Tensor, alibi_tensor: Tensor, mask=None, kvcache_inputs=None):
         """Forward process of the MultiHeadAttention"""
@@ -772,6 +774,87 @@ class Baichuan13BAttention(nn.Cell):
         return attention_merge
 
 
+class Baichuan13BAttentionWithKBKInfer(Baichuan13BAttention):
+    """Baichuan13BAttentionWithKBKInfer"""
+
+    def __init__(self,
+                 batch_size,
+                 seq_length,
+                 dim: int = 512,
+                 n_heads: int = 8,
+                 n_kv_heads: Optional[int] = None,
+                 compute_dtype=mstype.float16,
+                 softmax_compute_dtype=mstype.float32,
+                 param_init_type=mstype.float32,
+                 use_past=False,
+                 is_dynamic=False,
+                 use_kvcache_op=False,
+                 is_flexible_shape=False,
+                 use_flash_attention=False,
+                 use_paged_attention=False,
+                 block_size: int = 128,
+                 num_blocks: int = 224,
+                 parallel_config=TransformerOpParallelConfig()):
+        super().__init__(batch_size,
+                         seq_length,
+                         dim,
+                         n_heads,
+                         n_kv_heads,
+                         compute_dtype,
+                         softmax_compute_dtype,
+                         param_init_type,
+                         use_past,
+                         is_dynamic,
+                         use_kvcache_op,
+                         is_flexible_shape,
+                         use_flash_attention,
+                         use_paged_attention,
+                         block_size,
+                         num_blocks,
+                         parallel_config)
+        self.use_flash_attention = use_flash_attention
+        self.flash_attention_score = FlashAttentionScore(head_num=self.n_head)
+        if not self.use_flash_attention or not self.use_paged_attention:
+            raise ValueError(
+                "KBK infer must set use_flash_attention and use_paged_attention True.")
+
+        self.paged_attention_mgr = PagedAttentionMgr(n_heads=self.n_head,
+                                                     head_dim=self.head_dim,
+                                                     hidden_size=self.hidden_size,
+                                                     n_kv_heads=self.n_kv_head,
+                                                     block_size=self.block_size,
+                                                     num_blocks=self.num_blocks,
+                                                     compute_dtype=self.dtype,
+                                                     input_layout="BSH")
+
+    def construct(self, x: Tensor, alibi_tensor: Tensor, mask=None, kvcache_inputs=None):
+        # alibi_tensor = self.my_alibi_tensor
+        """Forward process of the MultiHeadAttention"""
+        ori_dtype = x.dtype
+        query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
+        key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
+        value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
+
+        batch_valid_length, block_tables, slot_mapping = kvcache_inputs
+
+        if self.use_past:
+            key_out = self.paged_attention_mgr(key, value, slot_mapping)
+            query = ops.depend(query, key_out)
+
+        if self.is_first_iteration:
+            attention = self.flash_attention_score(
+                query, key, value, alibi_tensor, None, None, mask, None)
+        else:
+            attention = self.paged_attention_mgr.paged_attn_with_alibi(query,
+                                                                       batch_valid_length,
+                                                                       block_tables,
+                                                                       alibi_tensor)
+        output = self.wo(attention)  # dp, mp -> dp, 1 / dp * mp, 1
+        output = self.cast(output, ori_dtype)
+
+        return output
+
+
 class Baichuan13BDecodeLayer(nn.Cell):
     r"""
         Transformer Layer. This is an implementation of the single layer of the transformer
@@ -854,6 +937,7 @@ class Baichuan13BDecodeLayer(nn.Cell):
                  is_flexible_shape=False,
                  use_flash_attention=False,
                  use_paged_attention=False,
+                 use_kbk_infer=False,
                  block_size: int = 128,
                  num_blocks: int = 224,
                  parallel_config=TransformerOpParallelConfig()):
@@ -885,23 +969,42 @@ class Baichuan13BDecodeLayer(nn.Cell):
                                            is_dynamic=is_dynamic)
         self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
                                      is_dynamic=is_dynamic)
-        self.attention = Baichuan13BAttention(batch_size=batch_size,
-                                              seq_length=seq_length,
-                                              dim=dim,
-                                              n_heads=n_heads,
-                                              n_kv_heads=n_kv_heads,
-                                              compute_dtype=compute_dtype,
-                                              softmax_compute_dtype=softmax_compute_dtype,
-                                              param_init_type=param_init_type,
-                                              use_past=use_past,
-                                              is_dynamic=is_dynamic,
-                                              use_kvcache_op=use_kvcache_op,
-                                              is_flexible_shape=is_flexible_shape,
-                                              use_flash_attention=use_flash_attention,
-                                              use_paged_attention=use_paged_attention,
-                                              block_size=block_size,
-                                              num_blocks=num_blocks,
-                                              parallel_config=parallel_config)
+        if not use_kbk_infer:
+            self.attention = Baichuan13BAttention(batch_size=batch_size,
+                                                  seq_length=seq_length,
+                                                  dim=dim,
+                                                  n_heads=n_heads,
+                                                  n_kv_heads=n_kv_heads,
+                                                  compute_dtype=compute_dtype,
+                                                  softmax_compute_dtype=softmax_compute_dtype,
+                                                  param_init_type=param_init_type,
+                                                  use_past=use_past,
+                                                  is_dynamic=is_dynamic,
+                                                  use_kvcache_op=use_kvcache_op,
+                                                  is_flexible_shape=is_flexible_shape,
+                                                  use_flash_attention=use_flash_attention,
+                                                  use_paged_attention=use_paged_attention,
+                                                  block_size=block_size,
+                                                  num_blocks=num_blocks,
+                                                  parallel_config=parallel_config)
+        else:
+            self.attention = Baichuan13BAttention(batch_size=batch_size,
+                                                  seq_length=seq_length,
+                                                  dim=dim,
+                                                  n_heads=n_heads,
+                                                  n_kv_heads=n_kv_heads,
+                                                  compute_dtype=compute_dtype,
+                                                  softmax_compute_dtype=softmax_compute_dtype,
+                                                  param_init_type=param_init_type,
+                                                  use_past=use_past,
+                                                  is_dynamic=is_dynamic,
+                                                  use_kvcache_op=use_kvcache_op,
+                                                  is_flexible_shape=is_flexible_shape,
+                                                  use_flash_attention=use_flash_attention,
+                                                  use_paged_attention=use_paged_attention,
+                                                  block_size=block_size,
+                                                  num_blocks=num_blocks,
+                                                  parallel_config=parallel_config)
         self.feed_forward = LlamaFeedForward(dim=self.hidden_size,
                                              intermediate_size=intermediate_size,
                                              hidden_dim=4 * self.hidden_size,
@@ -1037,4 +1140,3 @@ class NormHead(nn.Cell):
         self.sum.shard(((parallel_config.model_parallel * parallel_config.data_parallel, 1),))
         self.matmul.shard(((1, 1),
                            (parallel_config.model_parallel * parallel_config.data_parallel, 1)))
- 

@@ -62,6 +62,7 @@ class LlamaSiLU(Cell):
     def __init__(self):
         super().__init__()
         if check_valid_big_kernel():
+            # pylint: disable=W0212
             self.silu = P._inner_ops.SiLU()
             self.self_define = False
         else:
@@ -344,13 +345,13 @@ class LlamaRMSNorm(nn.Cell):
             Tensor of shape :math:`(batch, seq_length, hidden_size)`.
     """
 
-    def __init__(self, dim, eps=1e-6, compute_type=mstype.float32, is_dynamic=False):
+    def __init__(self, dim, eps=1e-6, compute_type=mstype.float32, is_dynamic=False, use_fusion_op=False):
         super(LlamaRMSNorm, self).__init__()
         self.eps = eps
         self.compute_type = compute_type
         self.weight = Parameter(initializer('ones', (dim,), dtype=mstype.float32), parallel_optimizer=False)
 
-        if check_rmsnorm_big_kernel_valid(is_dynamic):
+        if check_rmsnorm_big_kernel_valid(is_dynamic) or use_fusion_op:
             self.norm = P.RmsNorm(eps)
             self.rms_norm = self._rms_norm
             self.self_define = False

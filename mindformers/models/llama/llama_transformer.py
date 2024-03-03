@@ -35,6 +35,8 @@ from mindformers.modules import KVCacheMgr, PagedAttentionMgr
 from mindformers.modules.flash_attention import FlashAttention
 from mindformers.modules.transformer.moe import MoEV2
 from mindformers.tools.logger import logger
+from mindformers.modules.layers import RotaryEmbedding
+from mindformers.modules.transformer import FlashAttentionScore
 
 
 class LLamaAttention(nn.Cell):
@@ -412,6 +414,117 @@ class LLamaAttention(nn.Cell):
         return attention_merge
 
 
+class LLamaAttentionWithKBKInfer(LLamaAttention):
+    """LLamaAttentionWithKBKInfer"""
+
+    def __init__(self,
+                 batch_size,
+                 seq_length,
+                 dim: int = 512,
+                 n_heads: int = 8,
+                 n_kv_heads: Optional[int] = None,
+                 qkv_concat=False,
+                 compute_dtype=mstype.float16,
+                 softmax_compute_dtype=mstype.float32,
+                 rotary_dtype=mstype.float32,
+                 param_init_type=mstype.float32,
+                 qkv_has_bias=False,
+                 use_past=False,
+                 is_dynamic=False,
+                 use_kvcache_op=False,
+                 is_flexible_shape=False,
+                 use_rope_slice=False,
+                 use_flash_attention=False,
+                 use_paged_attention=False,
+                 use_prompt_flash_attention=False,
+                 use_incre_flash_attention=False,
+                 block_size: Optional[int] = None,
+                 num_blocks: Optional[int] = None,
+                 parallel_config=TransformerOpParallelConfig()):
+        super().__init__(batch_size,
+                         seq_length,
+                         dim,
+                         n_heads,
+                         n_kv_heads,
+                         qkv_concat,
+                         compute_dtype,
+                         softmax_compute_dtype,
+                         rotary_dtype,
+                         param_init_type,
+                         qkv_has_bias,
+                         use_past,
+                         is_dynamic,
+                         use_kvcache_op,
+                         is_flexible_shape,
+                         use_rope_slice,
+                         use_flash_attention,
+                         use_paged_attention,
+                         use_prompt_flash_attention,
+                         use_incre_flash_attention,
+                         block_size,
+                         num_blocks,
+                         parallel_config)
+        self.context_position_ids = Tensor(ops.arange(seq_length, dtype=mstype.int64))
+        self.flash_attention_score = FlashAttentionScore(head_num=self.head_dim)
+        self.apply_rotary_pos_emb = RotaryEmbedding(dim=self.head_dim, max_seq_len=seq_length)
+
+        self.flash_attention_score.shard(parallel_config)
+        self.apply_rotary_pos_emb.shard(parallel_config)
+        self.paged_attention_mgr = PagedAttentionMgr(self.n_head,
+                                                     self.head_dim,
+                                                     self.hidden_size,
+                                                     n_kv_heads=self.n_kv_head,
+                                                     block_size=self.block_size,
+                                                     num_blocks=self.num_blocks,
+                                                     compute_dtype=compute_dtype,
+                                                     input_layout="BSH")
+
+    def construct(self, x: Tensor, freqs_cis: Tuple[Tensor, Tensor], mask=None, kvcache_inputs=None):
+        """Forward process of the MultiHeadAttention"""
+        ori_dtype = x.dtype
+        # [bs, seq/1, hidden_dim]
+        bs, _, _ = self.shape(x)
+        # [bs * seq/1, hidden_dim]
+        if self.qkv_concat:
+            x = self.reshape(x, (-1, x.shape[-1]))
+            bs_seq = x.shape[0]
+            qkv = self.cast(self.w(x), self.dtype)
+            query = self.slice_qkv(qkv, (0, 0), (bs_seq, self.hidden_size), (1, 1))
+            key = self.slice_qkv(qkv, (0, self.hidden_size),
+                                 (bs_seq, self.hidden_size + self.kv_dim), (1, 1))
+            value = self.slice_qkv(qkv, (0, self.hidden_size + self.kv_dim),
+                                   (bs_seq, self.hidden_size + self.kv_dim * 2), (1, 1))
+        else:
+            query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
+            key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
+            value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
+        batch_valid_length, block_tables, slot_mapping = kvcache_inputs
+        # rope
+        position_ids = None
+        if self.is_first_iteration:
+            position_ids = self.context_position_ids
+        else:
+            position_ids = batch_valid_length
+        query = self.reshape(query, (bs, -1, self.n_head * self.head_dim))
+        key = self.reshape(key, (bs, -1, self.n_kv_head * self.head_dim))
+        query, key = self.apply_rotary_pos_emb(query, key, position_ids)
+
+        if self.use_past:
+            key_out = self.paged_attention_mgr(key, value, slot_mapping)
+            query = ops.depend(query, key_out)
+
+        if self.is_first_iteration:
+            attention = self.flash_attention_score(query, key, value)
+        else:
+            attention = self.paged_attention_mgr.paged_attn(query, batch_valid_length, block_tables)
+
+        # [bs, seq/1, hidden_dim]
+        output = self.wo(attention)  # dp, mp -> dp, 1 / dp * mp, 1
+        output = self.cast(output, ori_dtype)
+
+        return output
+
+
 class LLamaDecodeLayer(nn.Cell):
     r"""
         Transformer Layer. This is an implementation of the single layer of the transformer
@@ -499,6 +612,7 @@ class LLamaDecodeLayer(nn.Cell):
                  moe_config=None,
                  use_flash_attention=False,
                  use_paged_attention=False,
+                 use_kbk_infer=False,
                  use_prompt_flash_attention=False,
                  use_incre_flash_attention=False,
                  block_size: Optional[int] = None,
@@ -522,33 +636,59 @@ class LLamaDecodeLayer(nn.Cell):
         self.shape = P.Shape()
         self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.add = P.Add()
-        self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
-                                           is_dynamic=is_dynamic)
         self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
                                      is_dynamic=is_dynamic)
-        self.attention = LLamaAttention(batch_size=batch_size,
-                                        seq_length=seq_length,
-                                        dim=dim,
-                                        n_heads=n_heads,
-                                        n_kv_heads=n_kv_heads,
-                                        qkv_concat=qkv_concat,
-                                        compute_dtype=compute_dtype,
-                                        softmax_compute_dtype=softmax_compute_dtype,
-                                        rotary_dtype=rotary_dtype,
-                                        param_init_type=param_init_type,
-                                        qkv_has_bias=qkv_has_bias,
-                                        use_past=use_past,
-                                        is_dynamic=is_dynamic,
-                                        use_kvcache_op=use_kvcache_op,
-                                        is_flexible_shape=is_flexible_shape,
-                                        use_rope_slice=use_rope_slice,
-                                        use_flash_attention=use_flash_attention,
-                                        use_paged_attention=use_paged_attention,
-                                        use_prompt_flash_attention=use_prompt_flash_attention,
-                                        use_incre_flash_attention=use_incre_flash_attention,
-                                        block_size=block_size,
-                                        num_blocks=num_blocks,
-                                        parallel_config=parallel_config)
+        self.use_kbk_infer = use_kbk_infer
+        if use_kbk_infer:
+            self.attention = LLamaAttentionWithKBKInfer(batch_size=batch_size,
+                                                        seq_length=seq_length,
+                                                        dim=dim,
+                                                        n_heads=n_heads,
+                                                        n_kv_heads=n_kv_heads,
+                                                        qkv_concat=qkv_concat,
+                                                        compute_dtype=compute_dtype,
+                                                        softmax_compute_dtype=softmax_compute_dtype,
+                                                        rotary_dtype=rotary_dtype,
+                                                        param_init_type=param_init_type,
+                                                        qkv_has_bias=qkv_has_bias,
+                                                        use_past=use_past,
+                                                        is_dynamic=is_dynamic,
+                                                        use_kvcache_op=use_kvcache_op,
+                                                        is_flexible_shape=is_flexible_shape,
+                                                        use_rope_slice=use_rope_slice,
+                                                        use_flash_attention=use_flash_attention,
+                                                        use_paged_attention=use_paged_attention,
+                                                        block_size=block_size,
+                                                        num_blocks=num_blocks,
+                                                        parallel_config=parallel_config)
+            self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
+                                               is_dynamic=is_dynamic, use_fusion_op=True)
+        else:
+            self.attention = LLamaAttention(batch_size=batch_size,
+                                            seq_length=seq_length,
+                                            dim=dim,
+                                            n_heads=n_heads,
+                                            n_kv_heads=n_kv_heads,
+                                            qkv_concat=qkv_concat,
+                                            compute_dtype=compute_dtype,
+                                            softmax_compute_dtype=softmax_compute_dtype,
+                                            rotary_dtype=rotary_dtype,
+                                            param_init_type=param_init_type,
+                                            qkv_has_bias=qkv_has_bias,
+                                            use_past=use_past,
+                                            is_dynamic=is_dynamic,
+                                            use_kvcache_op=use_kvcache_op,
+                                            is_flexible_shape=is_flexible_shape,
+                                            use_rope_slice=use_rope_slice,
+                                            use_flash_attention=use_flash_attention,
+                                            use_paged_attention=use_paged_attention,
+                                            use_prompt_flash_attention=use_prompt_flash_attention,
+                                            use_incre_flash_attention=use_incre_flash_attention,
+                                            block_size=block_size,
+                                            num_blocks=num_blocks,
+                                            parallel_config=parallel_config)
+            self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
+                                               is_dynamic=is_dynamic)
         self.expert_num = 1 if moe_config is None else moe_config.expert_num
         ffn = LlamaFeedForward(dim=self.hidden_size,
                                intermediate_size=intermediate_size,
@@ -613,6 +753,8 @@ class LLamaDecodeLayer(nn.Cell):
 
     def _check_input(self, x, freqs_cis, mask):
         r"""Check inputs"""
+        if self.use_kbk_infer:
+            return True
         _check_input_dtype(
             x.dtype, "x", [mstype.float32, mstype.float16, mstype.bfloat16], self.cls_name)
         freqs_cos, freqs_sin, swap_mask = freqs_cis

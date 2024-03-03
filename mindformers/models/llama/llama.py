@@ -158,7 +158,7 @@ class LlamaModel(LlamaPreTrainedModel):
             PFA_VALID, 'PromptFlashAttention')
         config.use_incre_flash_attention = config.use_incre_flash_attention and check_valid_flash_attention(
             IFA_VALID, 'IncreFlashAttention')
-
+        self.use_kbk_infer = config.use_kbk_infer
         self.shape = P.Shape()
         self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.cast = P.Cast()
@@ -232,6 +232,7 @@ class LlamaModel(LlamaPreTrainedModel):
                                          use_paged_attention=config.use_paged_attention,
                                          use_prompt_flash_attention=config.use_prompt_flash_attention,
                                          use_incre_flash_attention=config.use_incre_flash_attention,
+                                         use_kbk_infer=config.use_kbk_infer,
                                          block_size=config.block_size,
                                          num_blocks=config.num_blocks,
                                          is_dynamic=config.is_dynamic,
@@ -447,6 +448,17 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         return input_ids, None, None, None, None, None, None, batch_valid_length, batch_index, zactivate_len, \
                block_tables, slot_mapping
+
+    def set_dynamic_inputs(self):
+        dynamic_input_ids = Tensor(shape=[None, None], dtype=ms.int32)
+        dynamic_input_position = Tensor(shape=[None], dtype=ms.int32)
+        dynamic_init_reset = Tensor([False], mstype.bool_)
+        dynamic_batch_valid_length = Tensor(shape=[None, None], dtype=ms.int64)
+        dynamic_block_tables = Tensor(shape=[None, None], dtype=ms.int64)
+        dynamic_slot_mapping = Tensor(shape=[None], dtype=ms.int32)
+        self.set_inputs(dynamic_input_ids, None, dynamic_input_position, None, None, None, dynamic_init_reset,
+                        dynamic_batch_valid_length, None, None, dynamic_block_tables, dynamic_slot_mapping)
+        logger.info("Set dynamic input for llama.")
 
     # pylint: disable=W0613
     def construct(self, input_ids, labels=None, input_position=None, position_ids=None, attention_mask=None,

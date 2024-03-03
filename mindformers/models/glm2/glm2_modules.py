@@ -54,39 +54,54 @@ class ChatGLM2RMSNorm(nn.Cell):
         Outputs:
             Tensor of shape :math:`(batch, seq_length, hidden_size)`.
     """
-    def __init__(self, dim, eps=1e-6, param_init_type=mstype.float32):
+
+    def __init__(self, dim, eps=1e-6, param_init_type=mstype.float32, use_kbk_infer=False):
         super(ChatGLM2RMSNorm, self).__init__()
         self.eps = Tensor(float(eps), dtype=param_init_type)
         self.weight = Parameter(initializer('ones', (dim,), dtype=param_init_type))
-        self.square = P.Square()
-        self.mean = P.ReduceMean(keep_dims=True)
-        self.add = P.Add()
-        self.rsqrt = P.Rsqrt()
-        self.mul = P.Mul()
-        self.mul2 = P.Mul()
 
-    def _norm(self, x):
+        if use_kbk_infer:
+            self.norm = P.RmsNorm(eps)
+            self.rms_norm = self._rms_norm
+            self.self_define = False
+        else:
+            self.square = P.Square()
+            self.mean = P.ReduceMean(keep_dims=True)
+            self.add = P.Add()
+            self.rsqrt = P.Rsqrt()
+            self.mul = P.Mul()
+            self.mul2 = P.Mul()
+            self.rms_norm = self._self_norm
+            self.self_define = True
+
+    def _self_norm(self, x):
         # shard:(dp, 1, 1)
         norm_factor = self.square(x)
         norm_factor = self.mean(norm_factor, -1)
         norm_factor = self.add(norm_factor, self.eps)
         norm_factor = self.rsqrt(norm_factor)
-        return self.mul(x, norm_factor)
-
-    def construct(self, x):
-        """Forward of RMSNorm."""
-        output = self._norm(x)
+        output = self.mul(x, norm_factor)
         output = self.mul2(output, self.weight)
         return output
 
+    def _rms_norm(self, x):
+        return self.norm(x, self.weight)[0]
+
+    def construct(self, x):
+        """Forward of RMSNorm."""
+        return self.rms_norm(x)
+
     def shard(self, strategy):
         """Parallel strategy configuratiuon interface."""
-        self.square.shard(strategy)
-        self.mean.shard(strategy)
-        self.rsqrt.shard(strategy)
-        self.add.shard((strategy[0], ()))
-        self.mul.shard((strategy[0], strategy[0]))
-        self.mul2.shard((strategy[0], (1,)))
+        if self.self_define:
+            self.square.shard(strategy)
+            self.mean.shard(strategy)
+            self.rsqrt.shard(strategy)
+            self.add.shard((strategy[0], ()))
+            self.mul.shard((strategy[0], strategy[0]))
+            self.mul2.shard((strategy[0], (1,)))
+        else:
+            self.norm.shard((strategy[0], (1,)))
 
 
 class ChatGLM2SiLU(nn.Cell):
@@ -99,25 +114,40 @@ class ChatGLM2SiLU(nn.Cell):
         Outputs:
             Tensor. x = x * sigmod(x).
     """
-    def __init__(self):
+
+    def __init__(self, use_kbk_infer=False):
         super(ChatGLM2SiLU, self).__init__()
-        self.sigmoid = P.Sigmoid()
-        self.mul = P.Mul()
+        if use_kbk_infer:
+            # pylint: disable=W0212
+            self.silu = P._inner_ops.SiLU()
+            self.self_define = False
+        else:
+            self.sigmoid = P.Sigmoid()
+            self.mul = P.Mul()
+            self.silu = self._self_silu
+            self.self_define = True
 
     def shard(self, strategy):
-        self.sigmoid.shard(strategy)
-        self.mul.shard((strategy[0], strategy[0]))
+        if self.self_define:
+            self.sigmoid.shard(strategy)
+            self.mul.shard((strategy[0], strategy[0]))
+        else:
+            self.silu.shard(strategy)
+
+    def _self_silu(self, x):
+        return self.mul(x, self.sigmoid(x))
 
     def construct(self, x):
-        return self.mul(x, self.sigmoid(x))
+        return self.silu(x)
 
 
 class ChatGLM2SwiGLU(nn.Cell):
     """SwiGLU activation function."""
-    def __init__(self):
+
+    def __init__(self, use_kbk_infer=False):
         super(ChatGLM2SwiGLU, self).__init__()
         self.split = P.Split(axis=-1, output_num=2)
-        self.silu = ChatGLM2SiLU()
+        self.silu = ChatGLM2SiLU(use_kbk_infer=use_kbk_infer)
         self.mul = P.Mul()
 
     def construct(self, x):
@@ -137,6 +167,7 @@ class ChatGLM2MLP(nn.Cell):
     hidden dimension, perform nonlinear transformation, and project the
     state back into h hidden dimension.
     """
+
     def __init__(self, config: ChatGLM2Config):
         super(ChatGLM2MLP, self).__init__()
         self.add_bias = config.add_bias_linear
@@ -152,7 +183,7 @@ class ChatGLM2MLP(nn.Cell):
             strategy_bias=((config.parallel_config.data_parallel, config.parallel_config.model_parallel),
                            (config.parallel_config.model_parallel,)))
 
-        self.activation_func = ChatGLM2SwiGLU()
+        self.activation_func = ChatGLM2SwiGLU(use_kbk_infer=config.use_kbk_infer)
         # shard need to be checked.
         self.activation_func.shard(((config.parallel_config.data_parallel, 1, 1),))
 
