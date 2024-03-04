@@ -110,47 +110,65 @@ class QwenForCausalLM(BaseModel):
         return LlamaForCausalLM.prepare_inputs_for_export(self, full_model)
 
     # pylint: disable=W0613
-    def construct(self, input_ids, labels=None, input_position=None, position_ids=None, attention_mask=None,
+    def construct(self, input_ids=None, labels=None, input_position=None, position_ids=None, attention_mask=None,
                   input_embeds=None, init_reset=True, batch_valid_length=None, batch_index=None, zactivate_len=None):
         """construct"""
-        bsz, seqlen = input_ids.shape
+
+        if input_ids is None and input_embeds is None:
+            raise ValueError()
+
+        if input_embeds is None and input_ids is not None:
+            bsz, seqlen = input_ids.shape
+            if self.training:
+                tokens = self.slice(input_ids, (0, 0), (bsz, seqlen - 1), (1, 1))
+            else:
+                tokens = input_ids
+
+            input_embeds = self.to_embeddings(tokens)
+
+            if attention_mask is None:
+                input_attention_masks = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
+            else:
+                input_attention_masks = attention_mask
+        else:
+            # pass embeds, and attn_mask, label
+            bsz, seqlen, _ = input_embeds.shape
+            input_attention_masks = attention_mask
+
         if self.use_past:
             if not isinstance(batch_valid_length, Tensor):
                 batch_valid_length = self.ones((bsz,), mstype.int32)
-        if self.training:
-            tokens = self.slice(input_ids, (0, 0), (bsz, seqlen - 1), (1, 1))
-        else:
-            tokens = input_ids
 
         if batch_valid_length is not None:
             batch_valid_length = self.reshape(batch_valid_length, (-1,))
         if not self.is_first_iteration:
             batch_valid_length = self.sub_batch_valid_len(batch_valid_length, 1)
 
-        output = self.transformer(tokens, init_reset=init_reset, batch_valid_length=batch_valid_length,
+        output = self.transformer(input_embeds=input_embeds, input_attention_masks=input_attention_masks, init_reset=init_reset, batch_valid_length=batch_valid_length,
                                   batch_index=batch_index, zactivate_len=zactivate_len)
         pre_gather = (not self.use_past or self.is_first_iteration) and batch_valid_length is not None
         if pre_gather:
             output = self.gather(output, self.sub_batch_valid_len(batch_valid_length, 1), 1)
         logits = self.lm_head(output)
 
-        input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
-        if labels is None:
-            labels = self.slice(input_ids, (0, 1), (bsz, seqlen), (1, 1))
-        else:
-            if labels.ndim > 1:
-                if self.training:
-                    labels = self.slice(labels, (0, 1), (bsz, seqlen), (1, 1))
-                label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), mstype.float32)
-                input_mask = self.mul(input_mask, label_mask)
-
         if not self.training:
             if not pre_gather:
                 logits = self.reshape(logits, (bsz, seqlen, -1))
             logits = self.cast(logits, mstype.float32)
             # makes cast effective to avoid allgather issue in Mindspore1.10
-            input_mask = self.add(input_mask, 1)
-            return logits, tokens, input_mask
+            input_mask = self.add(input_attention_masks, 1)
+            return logits, input_mask
+
+        input_mask = input_attention_masks
+        if labels is None:
+            labels = self.slice(input_ids, (0, 1), (bsz, seqlen), (1, 1))
+        else:
+            if labels.ndim > 1:
+                if self.training:
+                    _, label_seqlen = labels.shape
+                    labels = self.slice(labels, (0, 1), (bsz, label_seqlen), (1, 1))
+                label_mask = self.cast(self.not_equal(labels, self.ignore_token_id), mstype.float32)
+                input_mask = self.mul(input_attention_masks, label_mask)
 
         if logits.ndim > 2:
             logits = self.reshape(logits, (-1, logits.shape[-1]))
@@ -159,6 +177,11 @@ class QwenForCausalLM(BaseModel):
         input_mask = self.reshape(input_mask, (-1,))
         loss = self.loss(logits, labels, input_mask)
         return loss
+
+    def to_embeddings(self, input_ids):
+        input_embeds = self.transformer.wte(input_ids)
+        input_embeds = self.transformer.drop(input_embeds)
+        return input_embeds
 
     def shard(self, parallel_config):
         """sharding for feedforward"""
@@ -278,30 +301,22 @@ class QwenModel(BaseModel):
                 self.ln_f.set_comm_fusion(config.parallel_config.gradient_aggregation_group)
 
     # pylint: disable=W0613
-    def construct(self, input_ids: Tensor, init_reset=True, batch_valid_length=None, batch_index=None,
+    def construct(self, input_embeds: Tensor, input_attention_masks: Tensor,
+                  init_reset=True, batch_valid_length=None, batch_index=None,
                   zactivate_len=None):
         """construct"""
-        if input_ids is not None:
-            input_shape = input_ids.shape
-            input_ids = input_ids.view(-1, input_shape[-1])
-
-        # 1. wte
-        hidden_states = self.wte(input_ids)
-
-        # 2. drop
-        hidden_states = self.drop(hidden_states)
-
         # 2. rotary_emb
-        bs, seq_len = self.shape(input_ids)
+        hidden_states = input_embeds
+        bs, seq_len, _ = self.shape(hidden_states)
         if not self.use_past:
             freqs_cis = self.freqs_mgr()
-            mask = self.casual_mask(input_ids)  # mask: [bs, seq, seq]
+            mask = self.casual_mask(masks=input_attention_masks)  # mask: [bs, seq, seq]
             mask = self.casual_mask.post_process(mask)
             kvcache_inputs = None
         else:
             if self.is_first_iteration:
                 freqs_cis = self.freqs_mgr(seq_len)
-                mask = self.casual_mask(input_ids)  # mask: [bs, seq, seq]
+                mask = self.casual_mask(masks=input_attention_masks)  # mask: [bs, seq, seq]
             else:
                 freqs_cis = self.freqs_mgr.increment(batch_valid_length, bs)
                 if self.is_dynamic and self.is_flexible_shape and not self.use_kvcache_op:
@@ -491,11 +506,17 @@ class CausalMaskForQwen(nn.Cell):
         self.mul_post = P.Mul()
         self.expand_dim_post = P.ExpandDims()
 
-    def construct(self, tokens):
+    def construct(self, tokens=None, masks=None):
         """Forward process of the CausalMask"""
-        bs = self.shape(tokens)[0]
-        seq_len = self.shape(tokens)[1]
-        input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), self.dtype)
+        if tokens is not None:
+            bs = self.shape(tokens)[0]
+            seq_len = self.shape(tokens)[1]
+            input_mask = self.cast(self.not_equal(tokens, self.pad_token_id), self.dtype)
+        else:
+            bs = self.shape(masks)[0]
+            seq_len = self.shape(masks)[1]
+            input_mask = self.cast(masks, self.dtype)
+
         shape_right = (bs, 1, seq_len)
         # Mask the padded inputs
         mask_right = self.reshape(input_mask, shape_right)
