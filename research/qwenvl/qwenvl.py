@@ -404,15 +404,22 @@ class QwenVL(BaseModel):
             "img_pos": img_pos
         }
 
-    def concat_image_text(self, text_embeds, image_embeds, img_pos):
+    def concat_image_text(self, text_embeds, image_embeds, img_pos, is_multi_img=False):
         image_embeds = self.cast(image_embeds, text_embeds.dtype)
-        bs = text_embeds.shape[0]
-        for bs_idx in range(bs):
-            start_idx = img_pos.item((bs_idx, 0, 1))
-            indices = self.generate_index(start_idx)
-            update_values = self.gather(image_embeds, ms.Tensor(bs_idx, dtype=ms.int64), 0)
-            update_values = self.reshape(update_values, (self.image_embeds_element_size,))
-            text_embeds[bs_idx] = ops.tensor_scatter_update(text_embeds[bs_idx], indices, update_values)
+        if is_multi_img:
+            bs = text_embeds.shape[0]
+            max_img_size = img_pos.shape[1]
+            for bs_idx in range(bs):
+                for item_idx in range(max_img_size):
+                    img_idx = img_pos.item((bs_idx, item_idx, 0))
+                    start_idx = img_pos.item((bs_idx, item_idx, 1))
+
+                    indices = self.generate_index(start_idx)
+                    update_values = self.gather(image_embeds, bs_idx * max_img_size + img_idx, 0)
+                    update_values = self.reshape(update_values, (self.image_embeds_element_size,))
+                    text_embeds[bs_idx] = ops.tensor_scatter_update(text_embeds[bs_idx], indices, update_values)
+        else:
+            text_embeds[:, 1:self.num_queries + 1] = image_embeds
         return text_embeds
 
     def generate_index(self, start):
@@ -437,13 +444,15 @@ class QwenVL(BaseModel):
         input_attn_mask = self.cast(self.not_equal(tokens, self.pad_token_id), mstype.float32)
 
         if images is not None:
+            is_multi_img = False
             if images.ndim == 5:
                 images_shape = self.shape(images)
                 new_shape = (images_shape[0] * images_shape[1], images_shape[2], images_shape[3], images_shape[4])
                 images = self.reshape(images, new_shape)
+                is_multi_img = True
 
             image_embeds = self.vision_encoder(images)
-            input_embeds = self.concat_image_text(input_embeds, image_embeds, img_pos)
+            input_embeds = self.concat_image_text(input_embeds, image_embeds, img_pos, is_multi_img=is_multi_img)
 
         return self.llm_model(
             input_embeds=input_embeds,

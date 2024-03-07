@@ -183,7 +183,7 @@ class QwenVLSFTDataset(SFTDataSet):
                  read_function: Callable = None,
                  map_function_kwargs: dict = None,
                  out_img_shape: int = 448,
-                 max_img_len: int = 1):
+                 max_img_len: int = 5):
         if len(task_config.keys()) != 1 or task_config.get('sft') is None:
             raise ValueError("The task_config should be {'sft': {}} for stage 3 dataset")
         annotation_files = task_config['sft'].get('annotation_files')
