@@ -74,7 +74,7 @@ eval_dataset_task:
   type: CausalLanguageModelDataset
   dataset_config: *eval_dataset
 
-use_parallel: True
+use_parallel: False
 # parallel context config
 parallel:
   parallel_mode: 1 # 0-data parallel, 1-semi-auto parallel, 2-auto parallel, 3-hybrid parallel
@@ -128,7 +128,6 @@ context:
   save_graphs: False
   save_graphs_path: "./graph"
   device_id: 0
-  runtime_num_threads: 1
 
 # model config
 model:
@@ -157,6 +156,9 @@ model:
     use_flash_attention: True # FA can accelerate training or finetune
     use_paged_attention: True
     use_kbk_infer: True
+    block_size: 16
+    num_blocks: 1024
+  
     offset: 0
     checkpoint_name_or_path: "llama2_7b"
     repetition_penalty: 1
