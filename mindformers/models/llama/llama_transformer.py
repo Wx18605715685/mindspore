@@ -467,9 +467,6 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
         self.context_position_ids = Tensor(ops.arange(seq_length, dtype=mstype.int64))
         self.flash_attention_score = FlashAttentionScore(head_num=self.head_dim)
         self.apply_rotary_pos_emb = RotaryEmbedding(dim=self.head_dim, max_seq_len=seq_length)
-
-        self.flash_attention_score.shard(parallel_config)
-        self.apply_rotary_pos_emb.shard(parallel_config)
         self.paged_attention_mgr = PagedAttentionMgr(self.n_head,
                                                      self.head_dim,
                                                      self.hidden_size,
@@ -478,6 +475,10 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
                                                      num_blocks=self.num_blocks,
                                                      compute_dtype=compute_dtype,
                                                      input_layout="BSH")
+        
+        self.flash_attention_score.shard(parallel_config)
+        self.apply_rotary_pos_emb.shard(parallel_config)
+        self.paged_attention_mgr.shard(parallel_config)
 
     def construct(self, x: Tensor, freqs_cis: Tuple[Tensor, Tensor], mask=None, kvcache_inputs=None):
         """Forward process of the MultiHeadAttention"""
