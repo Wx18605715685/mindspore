@@ -484,7 +484,7 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
         """Forward process of the MultiHeadAttention"""
         ori_dtype = x.dtype
         # [bs, seq/1, hidden_dim]
-        bs, _, _ = self.shape(x)
+        bs, seq_len, _ = self.shape(x)
         # [bs * seq/1, hidden_dim]
         if self.qkv_concat:
             x = self.reshape(x, (-1, x.shape[-1]))
@@ -506,8 +506,8 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
             position_ids = self.context_position_ids
         else:
             position_ids = batch_valid_length
-        query = self.reshape(query, (bs, -1, self.n_head * self.head_dim))
-        key = self.reshape(key, (bs, -1, self.n_kv_head * self.head_dim))
+        query = self.reshape(query, (bs, seq_len, self.n_head * self.head_dim))
+        key = self.reshape(key, (bs, seq_len, self.n_kv_head * self.head_dim))
         query, key = self.apply_rotary_pos_emb(query, key, position_ids)
 
         if self.use_past:
