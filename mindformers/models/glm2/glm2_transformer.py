@@ -20,19 +20,23 @@ import mindspore.ops.functional as F
 import mindspore.ops.operations as P
 from mindspore import Parameter, Tensor, nn, ops
 from mindspore import dtype as mstype
+
 try:
     from mindspore.nn.layer.flash_attention import FlashAttention
+
     FLASHATTENTION_IMPORT_VALID = True
 except ImportError:
     FLASHATTENTION_IMPORT_VALID = False
 try:
     from mindspore.ops.operations.nn_ops import PromptFlashAttention
+
     PROMPTFLASHATTENTION_VALID = True
 except ImportError:
     PROMPTFLASHATTENTION_VALID = False
 
 try:
     from mindspore.ops.operations.nn_ops import IncreFlashAttention
+
     INCREFLASHATTENTION_VALID = True
 except ImportError:
     INCREFLASHATTENTION_VALID = False
@@ -183,7 +187,7 @@ class ChatGLM2SelfAttention(nn.Cell):
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
             self.qkv_hidden_size = (
-                self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num)
+                    self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num)
 
         dp, mp = config.parallel_config.data_parallel, config.parallel_config.model_parallel
         self.query_key_value = Linear(config.hidden_size,
@@ -645,7 +649,7 @@ class ChatGLM2SelfAttentionKBKInfer(nn.Cell):
         if self.multi_query_attention:
             self.num_multi_query_groups_per_partition = config.multi_query_group_num
             self.qkv_hidden_size = (
-                self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num)
+                    self.projection_size + 2 * self.hidden_size_per_attention_head * config.multi_query_group_num)
 
         parallel_config = config.parallel_config
 
@@ -687,38 +691,10 @@ class ChatGLM2SelfAttentionKBKInfer(nn.Cell):
 
         self.rotary_dim = (config.hidden_size // config.num_attention_heads if
                            config.kv_channels is None else config.kv_channels)
-        self.rotary_pos_emb = RotaryEmbedding(dim=self.rotary_dim // 2, base=1000, max_seq_len=config.seq_length,
-                                              cos_format=1)
+        self.rotary_pos_emb = RotaryEmbedding(dim=self.rotary_dim, base=1000, max_seq_len=config.seq_length,
+                                              cos_format=1, rotary_half=True)
         self.rotary_pos_emb.shard(parallel_config)
         self.context_position_ids = Tensor(np.arange(config.seq_length), dtype=mstype.int64)
-        self.split_rope = P.Split(axis=-1, output_num=2)
-        self.concat = P.Concat(axis=-1)
-
-    def apply_rotary_pos_emb_kbk_infer(self, query: Tensor, key: Tensor, position_ids):
-        """apply rotary pos emb kbk infer."""
-
-        d1 = self.rotary_dim  # D1 is 128
-        b, s, _ = query.shape
-        nq = query.shape[2] // d1
-        nk = key.shape[2] // d1
-        d2 = d1 // 2  # D2 is 64
-
-        query = query.reshape((b, s, nq, d1))
-        key = key.reshape((b, s, nk, d1))
-        # query, query_pass = query[..., 0:D2], query[..., D2:D1]
-        # key, key_pass = key[..., 0:D2], key[..., D2:D1]
-        query, query_pass = self.split_rope(query)
-        key, key_pass = self.split_rope(key)
-
-        query = query.reshape((b, s, nq * d2))
-        key = key.reshape((b, s, nk * d2))
-        query, key = self.rotary_pos_emb(query, key, position_ids)
-        query = query.reshape((b, s, nq, d2))
-        key = key.reshape((b, s, nk, d2))
-
-        query_embd = self.concat((query, query_pass)).reshape(b, s, nq * d1)
-        key_embd = self.concat((key, key_pass)).reshape(b, s, nk * d1)
-        return query_embd, key_embd
 
     def construct(self, hidden_states, batch_valid_length=None, block_tables=None, slot_mapping=None):
         """Forward process of self-attention."""
@@ -755,8 +731,7 @@ class ChatGLM2SelfAttentionKBKInfer(nn.Cell):
             position_ids = batch_valid_length
         else:
             position_ids = self.context_position_ids
-        query_layer, key_layer = self.apply_rotary_pos_emb_kbk_infer(query_layer, key_layer, position_ids)
-
+        query_layer, key_layer = self.rotary_pos_emb(query_layer, key_layer, position_ids)
         key_present = key_layer
         value_present = value_layer
 

@@ -950,8 +950,10 @@ class AlibiTensorV2(nn.Cell):
 class RotaryEmbedding(nn.Cell):
     """Rotary Embedding."""
 
-    def __init__(self, dim, base=10000, max_seq_len=2048, cos_format=0):
+    def __init__(self, dim, base=10000, max_seq_len=2048, cos_format=0, rotary_half=False):
         super(RotaryEmbedding, self).__init__()
+        if rotary_half:
+            dim = dim // 2
         inv_freq = 1.0 / (base ** (np.arange(0, dim, 2).astype(np.float16) * (1 / dim)))
         t = np.arange(max_seq_len, dtype=inv_freq.dtype)
         freqs = np.outer(t, inv_freq)
@@ -961,8 +963,12 @@ class RotaryEmbedding(nn.Cell):
             freqs = np.expand_dims(freqs, 2)
             emb = np.concatenate((freqs, freqs), axis=-1)
             emb = emb.reshape(max_seq_len, dim)
-        self.cos = Tensor(np.cos(emb), dtype=ms.float16)
-        self.sin = Tensor(np.sin(emb), dtype=ms.float16)
+        if rotary_half:
+            self.cos = Tensor(np.concatenate((np.cos(emb), np.ones_like(emb)), axis=-1), dtype=ms.float16)
+            self.sin = Tensor(np.concatenate((np.sin(emb), np.zeros_like(emb)), axis=-1), dtype=ms.float16)
+        else:
+            self.cos = Tensor(np.cos(emb), dtype=ms.float16)
+            self.sin = Tensor(np.sin(emb), dtype=ms.float16)
         self.apply_rotary_pos_emb = ops.ApplyRotaryPosEmb(cos_format)
 
     def construct(self, query, key, position_ids):
