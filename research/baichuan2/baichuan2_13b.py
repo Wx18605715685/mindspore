@@ -321,7 +321,8 @@ class Baichuan13BV2Model(Baichuan2PreTrainedModel):
                                                           compute_type=config.compute_dtype,
                                                           is_dynamic=config.is_dynamic,
                                                           pad_token_id=config.pad_token_id,
-                                                          use_flash_attention=config.use_flash_attention)
+                                                          use_flash_attention=config.use_flash_attention and
+                                                          not config.use_kbk_infer)
         self.tok_embeddings = LlamaEmbedding(vocab_table_size=config.vocab_size,
                                              embedding_size=config.hidden_size,
                                              param_init_type=config.param_init_type,
