@@ -23,6 +23,7 @@ from mindformers.modules.transformer.transformer import default_transformer_conf
 from mindformers.models.configuration_utils import PretrainedConfig
 from mindformers.models.utils import convert_mstype
 from mindformers.mindformer_book import MindFormerBook
+from mindformers.tools import logger
 
 __all__ = ['ChatGLM2Config']
 
