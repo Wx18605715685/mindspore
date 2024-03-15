@@ -445,6 +445,7 @@ class GenerationMixin:
         origin_len = np.sum(valid_length_each_example)
         prepare_time = time.time() - prepare_time
         logger.debug("forward prepare time: %s s", prepare_time)
+        infer_time = []
 
         if self.is_kbk_infer():
             block_mgr = BlockTables(self.config.num_blocks, self.config.block_size, self.config.seq_length)
@@ -570,6 +571,7 @@ class GenerationMixin:
                 else:
                     streamer.put(target_list)
             update_time = time.time() - update_time
+            infer_time.append(forward_time)
             logger.debug("forward time: %s s; greedy search time: %s s; update time: %s s; total count: %s s",
                          forward_time, search_time, update_time, forward_time + search_time + update_time)
 
@@ -587,6 +589,8 @@ class GenerationMixin:
         total_time = time.time() - total_time
         logger.info("total time: %s s; generated tokens: %s tokens; generate speed: %s tokens/s",
                     total_time, generate_len, generate_len / total_time)
+        logger.info("prefill time: %s s; decode total time: %s s",
+                    infer_time[0], np.sum(infer_time) - infer_time[0])
 
         return output_ids
 
