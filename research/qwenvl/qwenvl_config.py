@@ -40,10 +40,12 @@ class QwenVLConfig(BaseConfig):
                  softmax_compute_type: str = "float32",
                  param_init_type: str = "float16",
                  parallel_config: TransformerOpParallelConfig = default_parallel_config,
+                 micro_batch_interleave_num: int = 1,
                  **kwargs):
         super().__init__(**kwargs)
 
         self.vision_config = vision_config
+        self.vision_config.gelu_dtype = convert_mstype(self.vision_config.gelu_dtype)
         self.text_config = text_config
 
         self.num_queries = num_queries
@@ -58,6 +60,7 @@ class QwenVLConfig(BaseConfig):
         self.use_past = use_past
 
         self.parallel_config = parallel_config
+        self.micro_batch_interleave_num = micro_batch_interleave_num
 
         self.dtype = convert_mstype(dtype)
         self.compute_dtype = convert_mstype(compute_dtype)

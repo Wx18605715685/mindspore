@@ -179,15 +179,6 @@ class QwenVLProcessor(BaseProcessor):
         padded_text = img_padding.join(replaced_text)
         return padded_text, img_path
 
-    def _img_pos_postprocess(self, img_pos: List[np.ndarray]):
-        new_img_pos = []
-        for pos in img_pos:
-            num_img = len(pos)
-            pos = pos[np.newaxis].transpose(1, 0)
-            indices = np.arange(num_img)[np.newaxis].transpose(1, 0)
-            new_img_pos.append(np.hstack((indices, pos)))
-        return new_img_pos
-
     def __call__(self, image_input=None, text_input=None, task="caption"):
         """call function"""
         output = {}
@@ -210,6 +201,6 @@ class QwenVLProcessor(BaseProcessor):
 
         output["text"] = text_output
         output['image'] = image_output
-        output['img_pos'] = self._img_pos_postprocess(img_pos_output)
+        output['img_pos'] = img_pos
 
         return output
