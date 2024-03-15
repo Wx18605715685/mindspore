@@ -313,7 +313,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         # tokens: [bs, seq/1]
         h = self.tok_embeddings(tokens)
-        h = self.reshape(h, (bs, seq_len, self.hidden_size))
+        # h = self.reshape(h, (bs, seq_len, self.hidden_size))
         # h: [bs, seq/1, hidden_dim]
         for i in range(self.num_layers):
             h = self.layers[i](h, freqs_cis, mask, kvcache_inputs=kvcache_inputs)
@@ -511,8 +511,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 input_mask = self.mul(input_mask, label_mask)
 
         if not self.training:
-            if not pre_gather:
-                logits = self.reshape(logits, (bsz, seqlen, -1))
+            # if not pre_gather:
+            #    logits = self.reshape(logits, (bsz, seqlen, -1))
             logits = self.cast(logits, mstype.float32)
             # makes cast effective to avoid allgather issue in Mindspore1.10
             input_mask = self.add(input_mask, 1)
