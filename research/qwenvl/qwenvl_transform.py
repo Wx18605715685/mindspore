@@ -29,7 +29,7 @@ class QwenVLTransform:
 
     def __init__(self, tokenizer,
                  prompt=None,
-                 max_img_size=256,
+                 max_img_size=IMG_TOKEN_SPAN,
                  padding="max_length",
                  max_length=512,
                  max_annotation=None,
@@ -164,19 +164,20 @@ class QwenVLTransform:
                     img_start_temp.append(i + 1)
 
             if len(img_start_temp) == 0:
-                new_img_idx = [[0, self.max_length - IMG_TOKEN_SPAN]] * len(img_idx)
+                new_img_idx = [self.max_length - IMG_TOKEN_SPAN] * len(img_idx)
             else:
                 for i, idx in enumerate(img_idx):
                     if idx != -1:
-                        new_img_idx.append([idx, img_start_temp[i]])
+                        new_img_idx.append(img_start_temp[i])
                     else:
-                        new_img_idx.append([new_img_idx[0][0], img_start_temp[0]])
-
-            return raw_input_ids, new_img_idx, raw_label
+                        new_img_idx.append(img_start_temp[0])
+            coord = self._generate_coord(new_img_idx)
+            return raw_input_ids, coord, raw_label
 
         input_ids = np.array(output["input_ids"], dtype=np.int32)
         img_start_pos = np.where(input_ids == self.tokenizer.img_start_id)[0] + 1
-        return input_ids, img_start_pos
+        coord = self._generate_coord(img_start_pos)
+        return input_ids, coord
 
     def _add_start_end_label(self, input_list):
         im_start = self.tokenizer.im_start_id
@@ -184,3 +185,11 @@ class QwenVLTransform:
         nl_token_id = self.tokenizer('\n')["input_ids"]
         input_list = [im_start] + input_list + [im_end] + nl_token_id
         return input_list
+
+    def _generate_coord(self, img_start_pos):
+        num_img = len(img_start_pos)
+        coord = np.zeros((num_img, IMG_TOKEN_SPAN, 2), np.int32)
+        for idx, pos in enumerate(img_start_pos):
+            for img_pos in range(IMG_TOKEN_SPAN):
+                coord[idx, img_pos] = [0, pos + img_pos]
+        return coord

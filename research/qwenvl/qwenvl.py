@@ -16,6 +16,7 @@
 # ============================================================================
 """QwenVL models' APIs."""
 
+import os
 import math
 from collections import OrderedDict
 from typing import Optional
@@ -30,9 +31,9 @@ from mindspore.ops import operations as P
 from qwen.qwen_model import QwenForCausalLM
 
 from mindformers import BaseModel, MultiHeadAttention, MindFormerRegister, MindFormerModuleType
-from mindformers.models.clip.clip_modules import LayerNorm as ClipLayerNorm
 from mindformers.models.vit.vit_modules import get_2d_sincos_pos_embed
 from mindformers.modules.layers import LayerNorm, Linear
+from mindspore.parallel._utils import _get_parallel_mode
 from mindformers.tools.logger import logger
 from qwenvl_config import QwenVLConfig
 
@@ -152,7 +153,7 @@ class VisionTransformer(nn.Cell):
         layers = config.vision_config.num_hidden_layers
         heads = config.vision_config.num_attention_heads
         output_dim = config.proj_output_dim
-        dtype = config.dtype
+        dtype = config.compute_dtype
 
         self.conv1 = \
             nn.Conv2d(
@@ -164,7 +165,7 @@ class VisionTransformer(nn.Cell):
             Parameter(scale * Tensor(
                 np.random.normal(0, 1, size=(256, width))).astype(ms.float32))
         self.ln_pre = LayerNorm([width], eps=1e-6)
-        self.transformer = Transformer(width, layers, heads, dtype)
+        self.transformer = Transformer(width, layers, heads, config, dtype)
 
         self.attn_pool = Resampler(config)
 
@@ -264,6 +265,56 @@ class MultiheadAttention(nn.Cell):
         return attn_output
 
 
+
+class MLP(nn.Cell):
+    def __init__(self, d_model, layers, dtype, config):
+        super(MLP, self).__init__()
+        dp = config.parallel_config.data_parallel
+        mp = config.parallel_config.model_parallel
+        proj_std = (d_model ** -0.5) * ((2 * layers) ** -0.5)
+        fc_std = (2 * d_model) ** -0.5
+        mlp_width = int(d_model * config.vision_config.mlp_ratio)
+        c_fc = Linear(d_model, mlp_width, weight_init=Normal(mean=0.0, sigma=fc_std)).to_float(dtype)
+        c_fc.shard(strategy_matmul=((dp, 1), (mp, 1)), strategy_bias=((dp, mp), (mp,)))
+        self.c_fc = c_fc
+        c_proj = Linear(mlp_width, d_model, weight_init=Normal(mean=0.0, sigma=proj_std)).to_float(dtype)
+        c_proj.shard(strategy_matmul=((dp, 1), (mp, 1)), strategy_bias=((dp, mp), (mp,)))
+        self.c_proj = c_proj
+        self.gelu = NoApproximateGELU(config.parallel_config)
+        self.cast = P.Cast()
+        self.gelu_dtype = config.vision_config.gelu_dtype
+        self.dtype = P.DType()
+
+    def construct(self, x):
+        x = self.c_fc(x)
+        ori_dtype = self.dtype(x)
+        x = self.cast(x, self.gelu_dtype)
+        x = self.gelu(x)
+        x = self.cast(x, ori_dtype)
+        x = self.c_proj(x)
+        return x
+
+
+class NoApproximateGELU(nn.Cell):
+    def __init__(self, parallel_config):
+        super().__init__()
+        dp = parallel_config.data_parallel
+        mp = parallel_config.model_parallel
+        self.factor = Tensor(np.sqrt(2.0))
+        self.div = P.Div().shard(((dp, 1, mp), ()))
+        self.erf = P.Erf().shard(((dp, 1, mp),))
+        self.dtype = P.DType()
+        self.add = P.Add().shard(((dp, 1, mp), ()))
+        self.mul_const = P.Mul().shard(((dp, 1, mp), ()))
+        self.mul = P.Mul().shard(((dp, 1, mp), (dp, 1, mp)))
+
+    def construct(self, input_x):
+        x_dtype = self.dtype(input_x)
+        output = self.div(input_x, self.factor.astype(x_dtype))
+        output = self.add(self.erf(output), Tensor(1.0, x_dtype))
+        output = self.mul_const(self.mul(input_x, output), Tensor(0.5, x_dtype))
+        return output
+
 class ResidualAttentionBlock(nn.Cell):
     r"""
     ResidualAttentionBlock of CLIP
@@ -276,24 +327,18 @@ class ResidualAttentionBlock(nn.Cell):
         attn_mask (Optional[ms.Tensor]): attention mask.
     """
 
-    def __init__(self, d_model: int, n_head: int, layers: int,
+    def __init__(self, d_model: int, n_head: int, layers: int, config: QwenVLConfig,
                  dtype: mstype, attn_mask: Optional[ms.Tensor] = None):
         super(ResidualAttentionBlock, self).__init__()
-
-        proj_std = (d_model ** -0.5) * ((2 * layers) ** -0.5)
-        fc_std = (2 * d_model) ** -0.5
+        dp = config.parallel_config.data_parallel
+        mp = config.parallel_config.model_parallel
         self.dtype = dtype
-        mlp_width = int(d_model * 4.9231)
         self.attn = MultiheadAttention(d_model, n_head, layers, dtype)
-        self.ln_1 = ClipLayerNorm([d_model], epsilon=1e-6)
-        self.mlp = nn.SequentialCell(OrderedDict([
-            ("c_fc", nn.Dense(d_model, mlp_width,
-                              weight_init=Normal(mean=0.0, sigma=fc_std)).to_float(dtype)),
-            ("gelu", nn.GELU(approximate=False)),
-            ("c_proj", nn.Dense(mlp_width, d_model,
-                                weight_init=Normal(mean=0.0, sigma=proj_std)).to_float(dtype))
-        ]))
-        self.ln_2 = ClipLayerNorm([d_model], epsilon=1e-6)
+        self.ln_1 = LayerNorm((d_model,), eps=1e-6)
+        self.ln_1.layer_norm.shard(((dp, 1, 1), (1,), (1,)))
+        self.mlp = MLP(d_model, layers, dtype, config)
+        self.ln_2 = LayerNorm((d_model,), eps=1e-6)
+        self.ln_2.layer_norm.shard(((dp, 1, 1), (1,), (1,)))
         self.attn_mask = attn_mask
 
     def construct(self, input_x: ms.Tensor):
@@ -319,12 +364,12 @@ class Transformer(nn.Cell):
         dtype (mstype): The type of calculation, [mstype.float32, mstype.float16].
     """
 
-    def __init__(self, width, layers, heads, dtype, attn_mask=None):
+    def __init__(self, width, layers, heads, config, dtype, attn_mask=None):
         super(Transformer, self).__init__()
         self.width = width
         self.layers = layers
         self.resblocks = nn.SequentialCell(
-            *[ResidualAttentionBlock(width, heads, layers, dtype, attn_mask) for _ in range(layers)]
+            *[ResidualAttentionBlock(width, heads, layers, config, dtype, attn_mask) for _ in range(layers)]
         )
 
     def construct(self, input_x):
@@ -365,8 +410,19 @@ class QwenVL(BaseModel):
         self.ignore_token_id = ms.Tensor(config.ignore_token_id, mstype.int32)
         self.use_past = config.use_past
 
-        self.base_index = ms.Tensor(np.array([[query_idx, dim_idx] for query_idx in range(self.num_queries)
-                                              for dim_idx in range(config.text_config.hidden_size)]), ms.int32)
+        batch_size = config.text_config.batch_size
+        micro_batch_interleave_num = config.micro_batch_interleave_num
+        if _get_parallel_mode() in ["semi_auto_parallel", "auto_parallel"]:
+            full_batch = ms.get_auto_parallel_context("full_batch")
+            if full_batch:
+                self.batch_size = batch_size * config.parallel_config.data_parallel * micro_batch_interleave_num
+            else:
+                card_num = int(os.getenv('RANK_SIZE', '1'))
+                self.batch_size = int(card_num * batch_size / micro_batch_interleave_num)
+        else:
+            self.batch_size = batch_size
+        self.batch_index_adder = ms.Tensor([[i, 0] for i in range(self.batch_size)], ms.int32).reshape(self.batch_size, 1, 1, 2)
+        self.img_pos_add = P.Add().shard(((1, 1, 1, 1), (1, 1, 1, 1)))
 
     def freeze_component(self):
         if self.config.freeze_vision:
@@ -405,21 +461,9 @@ class QwenVL(BaseModel):
         }
 
     def concat_image_text(self, text_embeds, image_embeds, img_pos, is_multi_img=False):
+        img_pos = self.img_pos_add(img_pos, self.batch_index_adder).reshape((-1,) + img_pos.shape[-2:])
         image_embeds = self.cast(image_embeds, text_embeds.dtype)
-        if is_multi_img:
-            bs = text_embeds.shape[0]
-            max_img_size = img_pos.shape[1]
-            for bs_idx in range(bs):
-                for item_idx in range(max_img_size):
-                    img_idx = img_pos.item((bs_idx, item_idx, 0))
-                    start_idx = img_pos.item((bs_idx, item_idx, 1))
-
-                    indices = self.generate_index(start_idx)
-                    update_values = self.gather(image_embeds, bs_idx * max_img_size + img_idx, 0)
-                    update_values = self.reshape(update_values, (self.image_embeds_element_size,))
-                    text_embeds[bs_idx] = ops.tensor_scatter_update(text_embeds[bs_idx], indices, update_values)
-        else:
-            text_embeds[:, 1:self.num_queries + 1] = image_embeds
+        text_embeds = self.tensor_scatter_update(text_embeds, img_pos, image_embeds)
         return text_embeds
 
     def generate_index(self, start):
