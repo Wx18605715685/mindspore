@@ -637,8 +637,6 @@ class LLamaDecodeLayer(nn.Cell):
         self.shape = P.Shape()
         self.reshape = P.Reshape().add_prim_attr("skip_redistribution", True)
         self.add = P.Add()
-        self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
-                                     is_dynamic=is_dynamic)
         self.use_kbk_infer = use_kbk_infer
         if use_kbk_infer:
             self.attention = LLamaAttentionWithKBKInfer(batch_size=batch_size,
@@ -664,6 +662,8 @@ class LLamaDecodeLayer(nn.Cell):
                                                         parallel_config=parallel_config)
             self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
                                                is_dynamic=is_dynamic, use_fusion_op=True)
+            self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
+                                         is_dynamic=is_dynamic, use_fusion_op=True)
         else:
             self.attention = LLamaAttention(batch_size=batch_size,
                                             seq_length=seq_length,
@@ -690,6 +690,8 @@ class LLamaDecodeLayer(nn.Cell):
                                             parallel_config=parallel_config)
             self.attention_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
                                                is_dynamic=is_dynamic)
+            self.ffn_norm = LlamaRMSNorm(self.hidden_size, norm_eps, compute_type=layernorm_compute_dtype,
+                                         is_dynamic=is_dynamic)
         self.expert_num = 1 if moe_config is None else moe_config.expert_num
         ffn = LlamaFeedForward(dim=self.hidden_size,
                                intermediate_size=intermediate_size,
