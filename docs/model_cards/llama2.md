@@ -1200,151 +1200,52 @@ cd script
 bash run_distribute.sh rank_table_2.json configs/llama2/run_llama2_7b.yaml [0,2] predict "I love beijing, because"
 ```
 
-## Mindspore-Lite 推理
+## Mindspore 大模型推理
 
 ### 基本介绍
 
-　　MindFormers 定位打造训练->微调->部署的端到端大模型工具套件，为了更好性能地部署已经微调训练好的大模型，我们利用MindSpore打造的推理引擎 [MindSpore_lite](https://gitee.com/link?target=https%3A%2F%2Fwww.mindspore.cn%2Flite)，为用户提供了开箱即用的推理部署方案，为用户提供端到端的大模型解决方案，帮助用户使能大模型业务。
+　　MindFormers 定位打造训练->微调->部署的端到端大模型工具套件，为了更好性能地部署已经微调训练好的大模型，我们利用MindSpore打造了全新的推理引擎，为用户提供了开箱即用的推理部署方案，为用户提供端到端的大模型解决方案，帮助用户使能大模型业务。
 
-　　Lite 推理大致分两步：权重转换导出 MindIR -> Lite 推理，接下来分别描述上述两个过程。
+　　MindSpore 大模型推理大致分两步：设置环境变量 -> 执行推理，接下来分别描述上述两个过程。
 
-### 单卡导出与推理
-
-#### MindIR 导出
-
-  　　1. 以llama2_7b为例，修改模型相关的配置文件 configs/llama2/export_llama2_7b.yaml，其中需要关注这几项：
-
-```yaml
-# ==== model config ====
-model:
-  model_config:
-    seq_length: 512
-    checkpoint_name_or_path: "/path/to/your/*.ckpt"
-```
-
-2. 执行run_mindformer.py，完成模型转换
+### 环境变量 导出
 
 ```bash
-python run_mindformer.py --config configs/llama2/export_llama2_7b.yaml --run_mode export --use_parallel False --device_id 0
+export GRAPH_OP_RUN=1
+export MS_ENABLE_INTERNAL_KERNELS=on
 ```
 
-#### 执行推理
+### 单卡推理
 
-1. 新建推理配置文件：lite.ini
-
-   Atlas 800配置如下：
-
-   ```ini
-   [ascend_context]
-   provider=ge
-   [ge_session_options]
-   ge.externalWeight=1
-   ge.exec.atomicCleanPolicy=1
-   ge.event=notify
-   ge.exec.staticMemoryPolicy=2
-   ge.exec.precision_mode=must_keep_origin_dtype
-   ```
-
-   Atlas 800T A2默认配置如下：
-
-   ```ini
-   [ascend_context]
-   plugin_custom_ops=All
-   provider=ge
-   [ge_session_options]
-   ge.exec.formatMode=1
-   ge.exec.precision_mode=must_keep_origin_dtype
-   ```
-
-   Atlas 800T A2 高性能配置如下：
-
-   > 注: 高性能暂不支持llama2_7b
-
-   ```ini
-   [ascend_context]
-   plugin_custom_ops=All
-   provider=ge
-   [ge_session_options]
-   ge.externalWeight=1
-   ge.exec.formatMode=1
-   ge.exec.atomicCleanPolicy=1
-   ge.event=notify
-   ge.exec.staticMemoryPolicy=2
-   ge.exec.precision_mode=must_keep_origin_dtype
-   ```
-
-2. 执行命令
+执行命令
 
 ```bash
-python run_infer_main.py --device_id 0 --model_name llama2 --prefill_model_path llama2_export/llama2_7b_prefill_seq512_graph.mindir --increment_model_path llama2_export/llama2_7b_inc_seq512_graph.mindir --tokenizer_path /path/to/your/tokenizer.model --config_path lite.ini --is_sample_acceleration False --seq_length 4096 --add_special_tokens True
+python run_mindformer.py --config configs/llama/run_llama2_7b_910b_kbk_infer.yaml --run_mode predict --predict_data 'I love Beijing, because' --use_parallel False
 ```
 
-　　等待模型载入、编译后，出现：
-
-```bash
-Please enter your predict data:
-```
-
-　　输入：
-
-```bash
-I love Beijing, because
-```
-
-　　输出：
+输出：
 
 ```bash
 I love Beijing, because it is a city that is constantly changing. I have been living here for 10 years and I...
 ```
 
-### 多卡导出与推理
+### 分布式推理
 
-多卡lite推理查看[codellama.md](../model_cards/codellama.md)的多卡导出与推理
+#### 修改并行配置
 
-### 开启动态shape的多卡导出与推理
-
-#### MindIR 导出
-
-  以llama2_7b为例，只需要在模型相关的配置文件configs/llama2/export_llama2_7b.yaml中增加这几项，其它流程与多卡导出一致：
+以llama2_7b为例，修改模型相关的配置文件 configs/llama2/run_llama2_7b_910b_kbk_infer.yaml，其中需要关注这几项：
 
 ```yaml
 # ==== model config ====
-model:
-  model_config:
-    is_dynamic: True
-    use_kvcache_op: True
-    is_flexible_shape: False
-    use_rope_slice: True
+parallel_config:
+  data_parallel: 1
+  model_parallel: 4
+  pipeline_stage: 1
+  use_seq_parallel: False
 ```
 
 #### 执行推理
 
-执行推理有两个地方要改
-
-1、动态shape需要新建一个推理配置文件：`lite_inc.ini`，将多卡生成的`RANK_TABLE_FILE`文件也写入其中
-
 ```bash
-[ascend_context]
-plugin_custom_ops=All
-provider=ge
-rank_table_file=RANK_TABLE_FILE
-[ge_session_options]
-ge.exec.formatMode=1
-ge.exec.precision_mode=must_keep_origin_dtype
-ge.exec.atomicCleanPolicy=1
-ge.exec.staticMemoryPolicy=2
-[ge_graph_options]
-ge.inputShape=batch_index:-1;batch_valid_length:-1;tokens:-1,1;zactivate_len:-1
-ge.dynamicDims=1,1,1,256;4,4,4,256;16,16,16,256;1,1,1,1024;  # 这里的前三个表示batch_size，最后一位表示seq_length, 注意不能大于导出时给定的batch_size 和 seq_length;
-ge.dynamicNodeType=1
-```
-
-2、用来推理的run_lite.sh中，只需要修改两个参数，其它流程都与多卡推理一样
-
-**注**：执行推理时，需要给出与`ge.dynamicDims`中包含的batch_size，否则需要在`ge.dynamicDims`新增。
-
-```bash
---dynamic True  --config_path "lite.ini,lite_inc.ini" --batch_size 1  
-# batch_size 需要在ge.dynamicDims里包含，否则会报错。如上配置则batch_size，可以为1，4，16.
-# seq_length 会自动padding到celling,如上配置，输入长度小于256 则padding到256，否则padding到1024.
+mpirun --allow-run-as-root -n 4 python run_mindformer.py --config configs/llama/run_llama2_7b_910b_kbk_infer.yaml --run_mode predict --predict_data 'I love Beijing, because' --use_parallel True
 ```
