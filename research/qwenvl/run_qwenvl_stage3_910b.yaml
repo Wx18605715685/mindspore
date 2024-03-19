@@ -100,8 +100,8 @@ callbacks:
 
 # default parallel of device num = 8 for Atlas 800T A2
 parallel_config:
-  data_parallel: 2
-  model_parallel: 4
+  data_parallel: 8
+  model_parallel: 1
   pipeline_stage: 1
   micro_batch_num: 1
   vocab_emb_dp: False
@@ -111,8 +111,8 @@ micro_batch_interleave_num: &micro_batch_interleave_num 1
 
 # recompute config
 recompute_config:
-  recompute: False
-  select_recompute: False
+  recompute: True
+  select_recompute: True
   parallel_optimizer_comm_recompute: False
   mp_comm_recompute: False
   recompute_slice_activation: False
@@ -162,7 +162,7 @@ model:
       rotary_dtype: "float16"
       param_init_type: "float16"
       use_past: False
-      use_flash_attention: False
+      use_flash_attention: True
       use_past_shard: False
       offset: 0
       checkpoint_name_or_path: ""
@@ -212,7 +212,7 @@ parallel:
   enable_alltoall: False
   full_batch: True
   search_mode: "sharding_propagation"
-  enable_parallel_optimizer: False
+  enable_parallel_optimizer: True
   strategy_ckpt_config:
     save_file: "./ckpt_strategy.ckpt"
     only_trainable_params: False

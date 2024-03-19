@@ -48,8 +48,9 @@ class AbsPos(nn.Cell):
         self.reshape = P.Reshape()
         self.flatten = nn.Flatten(start_dim=0, end_dim=2)
         self.resize_shape = ms.Tensor([self.tgt_size, self.tgt_size], ms.int32)
+        # Resize does not support shard
         self.resize = P.ResizeBicubic(align_corners=False, half_pixel_centers=False)
-        self.transpose = P.Transpose()
+        self.transpose = P.Transpose().shard(((1, 1, 1, 1),))
 
     def construct(self, x: Tensor):
         if self.src_size != self.tgt_size:
@@ -68,6 +69,8 @@ class Resampler(nn.Cell):
     def __init__(self, config: QwenVLConfig):
         super().__init__()
 
+        dp = config.parallel_config.data_parallel
+        mp = config.parallel_config.model_parallel
         self.num_queries = config.num_queries
         self.query_grid_size = int(math.sqrt(config.num_queries))
 
@@ -76,14 +79,18 @@ class Resampler(nn.Cell):
 
         self.kv_dim = config.vision_config.hidden_size
 
-        self.pos_embed = Parameter(get_2d_sincos_pos_embed(self.embed_dim, self.query_grid_size), requires_grad=False)
+        self.pos_embed = Parameter(get_2d_sincos_pos_embed(self.embed_dim, self.query_grid_size), requires_grad=False, parallel_optimizer=False)
 
         self.query = Parameter(initializer(TruncatedNormal(mean=0.0, sigma=0.02), [self.num_queries, self.embed_dim]),
-                               requires_grad=False)
+                               requires_grad=False, parallel_optimizer=False)
 
         if self.kv_dim is not None and self.kv_dim != self.embed_dim:
             self.kv_proj = Linear(in_channels=self.kv_dim, out_channels=self.embed_dim,
                                   has_bias=False)  # TODO: weight init
+            self.kv_proj.shard(strategy_matmul=((dp, 1),
+                                                 (mp, 1)),
+                                strategy_bias=((dp, mp), (mp,))
+                                )
         else:
             self.kv_proj = nn.Identity()
 
@@ -101,13 +108,17 @@ class Resampler(nn.Cell):
                                        parallel_config=config.parallel_config.dp_mp_config)
 
         self.ln_q = LayerNorm((self.embed_dim,), eps=1e-6)
+        self.ln_q.shard(((1, 1,),))
         self.ln_kv = LayerNorm((self.embed_dim,), eps=1e-6)
+        self.ln_kv.shard(((dp, 1, 1),))
 
         self.abs_pos = AbsPos(self.pos_embed.shape[0], self.img_grid_size ** 2)
 
         self.shape = P.Shape()
-        self.tile = P.Tile()
-        self.add = P.Add()
+        self.tile = P.Tile().shard(((dp, 1, 1),))
+        self.add = P.Add().shard(((dp, 1, 1), (1, 1, 1)))
+        self.expand_dims = P.ExpandDims().shard(((dp, 1),))
+        self.expand_dims_no_shard = P.ExpandDims().shard(((1, 1),))
 
     def construct(self, x, attn_mask=None):
         # x: [bs, img_grid_size**2, width], [bs, 1024, 1664]
@@ -119,9 +130,12 @@ class Resampler(nn.Cell):
 
         q = self.ln_q(self.query)  # [num_queries, embed_dim] [256, 4096]]
 
+        query_tensor = self.add(self.tile(q, (bs, 1, 1)), self.expand_dims_no_shard(self.pos_embed, 0))
+        key_tensor = self.add(x, self.expand_dims_no_shard(pos_embed, 0))
+
         out = self.attn(
-            self.add(self.tile(q.unsqueeze(0), (bs, 1, 1)), self.pos_embed.unsqueeze(0)),  # [bs, 256, 4096]
-            self.add(x, pos_embed.unsqueeze(0)),  # [bs, 1024, 4096]
+            query_tensor,  # [bs, 256, 4096]
+            key_tensor,  # [bs, 1024, 4096]
             x,  # [bs, 1024, 4096]
             attention_mask=attn_mask
         )[0]
@@ -147,6 +161,7 @@ class VisionTransformer(nn.Cell):
     def __init__(self, config: QwenVLConfig):
         super(VisionTransformer, self).__init__()
 
+        parallel_config = config.parallel_config
         input_resolution = config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         width = config.vision_config.hidden_size
@@ -159,24 +174,30 @@ class VisionTransformer(nn.Cell):
             nn.Conv2d(
                 in_channels=3, out_channels=width, kernel_size=patch_size,
                 stride=patch_size, has_bias=False, pad_mode='pad').to_float(dtype)
+        self.conv1.conv2d.shard(((parallel_config.data_parallel, 1, 1, 1), (1, 1, 1, 1)))
+        self.conv1.bias_add.shard(((parallel_config.data_parallel, 1, 1, 1), (1,)))
 
         scale = width ** -0.5
         self.positional_embedding = \
             Parameter(scale * Tensor(
-                np.random.normal(0, 1, size=(256, width))).astype(ms.float32))
+                np.random.normal(0, 1, size=(256, width))).astype(ms.float32),
+                      parallel_optimizer=False)
         self.ln_pre = LayerNorm([width], eps=1e-6)
+        self.ln_pre.shard(((config.parallel_config.data_parallel, 1, 1),))
         self.transformer = Transformer(width, layers, heads, config, dtype)
 
         self.attn_pool = Resampler(config)
-
+        self.transpose = P.Transpose().shard(((parallel_config.data_parallel, 1, 1),))
         self.ln_post = LayerNorm([output_dim], eps=1e-6)
+        self.ln_post.shard(((config.parallel_config.data_parallel, 1, 1),))
         self.proj = \
             Parameter(scale * Tensor(np.random.normal(0, 1,
                                                       size=(output_dim, output_dim))).astype(ms.float32))
         self.dtype = dtype
-        self.add = P.Add()
+        self.add = P.Add().shard(((parallel_config.data_parallel, 1, 1), (1, 1)))
         img_grid_size = input_resolution // patch_size
         self.abs_pos = AbsPos(self.positional_embedding.shape[0], img_grid_size ** 2)
+        self.matmul = P.MatMul().shard(((parallel_config.data_parallel, 1), (parallel_config.model_parallel, 1)))
 
     def construct(self, input_x: ms.Tensor):
         r"""Construct
@@ -189,14 +210,16 @@ class VisionTransformer(nn.Cell):
         """
         input_x = self.conv1(input_x)
         input_x = input_x.reshape(input_x.shape[0], input_x.shape[1], -1)
-        input_x = input_x.transpose(0, 2, 1)
+        input_x = self.transpose(input_x, (0, 2, 1))
 
         abs_pos = self.abs_pos(self.positional_embedding)
         input_x = self.add(input_x, abs_pos)
         input_x = self.ln_pre(input_x)
-        input_x = input_x.transpose(1, 0, 2)
+        # ln_pre out (1, 1024, 1664)
+        # input_x = input_x.transpose(1, 0, 2)
+        # after transpose (1024, 1, 1664)
         input_x = self.transformer(input_x)
-        input_x = input_x.transpose(1, 0, 2)
+        # input_x = input_x.transpose(1, 0, 2)
         input_x = self.attn_pool(input_x)
         input_x = self.ln_post(input_x)
         input_x = ops.matmul(input_x, self.proj)
@@ -213,23 +236,41 @@ class MultiheadAttention(nn.Cell):
         dtype (mstype): The type of calculation, [mstype.float32, mstype.float16].
     """
 
-    def __init__(self, d_model: int, n_head: int, layers: int, dtype: mstype):
+    def __init__(self, d_model: int, n_head: int, layers: int, config: dict, dtype: mstype):
         super(MultiheadAttention, self).__init__()
 
+        dp = config.parallel_config.data_parallel
+        mp = config.parallel_config.model_parallel
         self.num_heads = n_head
         self.head_dim = d_model // n_head
+        self.embed_dim = d_model
 
-        self.softmax = nn.Softmax(-1)
-        self.transpose = ops.Transpose()
-        self.split = ops.Split(axis=-1, output_num=3)
         self.scaling = self.head_dim ** -0.5
 
         proj_std = (d_model ** -0.5) * ((2 * layers) ** -0.5)
         attn_std = d_model ** -0.5
-        self.out_proj = nn.Dense(d_model, d_model,
-                                 weight_init=Normal(mean=0.0, sigma=proj_std)).to_float(dtype)
-        self.in_proj = nn.Dense(d_model, 3 * d_model,
-                                weight_init=Normal(mean=0.0, sigma=attn_std)).to_float(dtype)
+
+        self.out_proj = Linear(d_model, d_model,
+                               weight_init=Normal(mean=0.0, sigma=proj_std)).to_float(dtype)
+        self.out_proj.shard(strategy_matmul=((dp, 1),
+                                             (mp, 1)),
+                            strategy_bias=((dp, mp), (mp,))
+                            )
+        self.in_proj = Linear(d_model, 3 * d_model,
+                              weight_init=Normal(mean=0.0, sigma=attn_std)).to_float(dtype)
+        self.in_proj.shard(strategy_matmul=((dp, 1),
+                                            (mp, 1)),
+                           strategy_bias=((dp, mp),
+                                          (mp,)))
+        self.batch_matmul = P.BatchMatMul().shard(((dp, mp, 1, 1), (dp, mp, 1, 1)))
+        self.merger_head_transpose = P.Transpose().shard(((dp, mp, 1, 1),))
+        self.split = ops.Split(axis=-1, output_num=3).shard(((dp, 1, mp, 1),))
+        self.split.add_prim_attr("skip_redistribution", True)
+        self.transpose = ops.Transpose().shard(((dp, 1, mp, 1),))
+        self.softmax = nn.Softmax(-1)
+        self.softmax.softmax.shard(((dp, mp, 1, 1),))
+        self.reshape = P.Reshape()
+        self.mul = P.Mul().shard(((dp, 1, mp, 1), ()))
 
     def construct(self, query: ms.Tensor, attn_mask: Optional[ms.Tensor] = None):
         r"""Construct
@@ -241,29 +282,69 @@ class MultiheadAttention(nn.Cell):
         Returns:
             attn_output (ms.Tensor): attention output.
         """
-        len_tgt, batch_size, width = query.shape
+        # origin (1024, 1, 1664) --> current (1, 1024, 1664)
+        batch_size, len_tgt, width = query.shape
         qkv = self.in_proj(query)
-        qkv = qkv.view(len_tgt, batch_size, self.num_heads, 3 * self.head_dim)
+        qkv = qkv.view(batch_size, len_tgt, self.num_heads, 3 * self.head_dim)
 
+        # current (1, 1024, 4992)
         att_q, att_k, att_v = self.split(qkv)
+        # after split (1, 1024, 1664)
 
-        att_q = att_q * self.scaling
-        att_q = att_q.view(len_tgt, batch_size * self.num_heads, self.head_dim).transpose((1, 0, 2))
-        att_k = att_k.view(-1, batch_size * self.num_heads, self.head_dim).transpose((1, 0, 2))
-        att_v = att_v.view(-1, batch_size * self.num_heads, self.head_dim).transpose((1, 0, 2))
+        att_q = self.mul(att_q, self.scaling)
+        # q (bsz, num_head, len_tgt, head_dim)
+        att_q = self.transpose(att_q, (0, 2, 1, 3))
+        # k (bsz, num_head, head_dim, len_tgt)
+        att_k = self.transpose(att_k, (0, 2, 3, 1))
+        # v (bsz, num_head, len_tgt, head_dim)
+        att_v = self.transpose(att_v, (0, 2, 1, 3))
 
         if attn_mask is not None:
-            attn_output_weights = attn_mask + ops.matmul(att_q, att_k.transpose((0, 2, 1)))
+            attn_output_weights = attn_mask + self.batch_matmul(att_q, att_k)
         else:
-            attn_output_weights = ops.matmul(att_q, att_k.transpose((0, 2, 1)))
+            attn_output_weights = self.batch_matmul(att_q, att_k)
         attn_output_weights = self.softmax(attn_output_weights)
-        attn_output = ops.matmul(attn_output_weights, att_v)
-        attn_output = attn_output.view(batch_size, self.num_heads, len_tgt, self.head_dim)
-        attn_output = self.transpose(attn_output, (2, 0, 1, 3))
-        attn_output = attn_output.view(len_tgt, batch_size, width)
+        attn_output = self.batch_matmul(attn_output_weights, att_v)
+        attn_output = self._merge_heads(attn_output)
         attn_output = self.out_proj(attn_output)
         return attn_output
 
+    def _merge_heads(self, x):
+        x = self.merger_head_transpose(
+            x, (0, 2, 1, 3))  # bs, seq_length, head, size_per_head
+        x_shape = P.Shape()(x)
+        new_shape = (x_shape[0], x_shape[1], x_shape[-2] * x_shape[-1])
+        x_merge = self.reshape(x, new_shape)
+        return x_merge
+
+
+class GELU(nn.Cell):
+    def __init__(self, parallel_config, approximate=False):
+        super().__init__()
+        self.approximate = approximate
+        if approximate:
+            self.gelu = P.Gelu()
+        else:
+            dp = parallel_config.data_parallel
+            mp = parallel_config.model_parallel
+            self.sqrt = P.Sqrt().shard(((dp, 1, mp),))
+            self.factor = Tensor(np.sqrt(2.0))
+            self.div = P.Div().shard(((dp, 1, mp), ()))
+            self.erf = P.Erf().shard(((dp, 1, mp),))
+            self.dtype = P.DType()
+            self.add = P.Add().shard(((dp, 1, mp), ()))
+            self.mul_const = P.Mul().shard(((dp, 1, mp), ()))
+            self.mul = P.Mul().shard(((dp, 1, mp), (dp, 1, mp)))
+
+    def construct(self, input_x):
+        if self.approximate:
+            output = self.gelu(input_x)
+        else:
+            x_dtype = self.dtype(input_x)
+            output = self.div(input_x, self.factor.astype(x_dtype))
+            output = self.add(self.erf(output), Tensor(1.0, x_dtype))
+            output = self.mul_const(self.mul(input_x, output), Tensor(0.5, x_dtype))
+        return output
 
 
 class MLP(nn.Cell):
@@ -280,7 +361,7 @@ class MLP(nn.Cell):
         c_proj = Linear(mlp_width, d_model, weight_init=Normal(mean=0.0, sigma=proj_std)).to_float(dtype)
         c_proj.shard(strategy_matmul=((dp, 1), (mp, 1)), strategy_bias=((dp, mp), (mp,)))
         self.c_proj = c_proj
-        self.gelu = NoApproximateGELU(config.parallel_config)
+        self.gelu = GELU(config.parallel_config)
         self.cast = P.Cast()
         self.gelu_dtype = config.vision_config.gelu_dtype
         self.dtype = P.DType()
@@ -294,26 +375,6 @@ class MLP(nn.Cell):
         x = self.c_proj(x)
         return x
 
-
-class NoApproximateGELU(nn.Cell):
-    def __init__(self, parallel_config):
-        super().__init__()
-        dp = parallel_config.data_parallel
-        mp = parallel_config.model_parallel
-        self.factor = Tensor(np.sqrt(2.0))
-        self.div = P.Div().shard(((dp, 1, mp), ()))
-        self.erf = P.Erf().shard(((dp, 1, mp),))
-        self.dtype = P.DType()
-        self.add = P.Add().shard(((dp, 1, mp), ()))
-        self.mul_const = P.Mul().shard(((dp, 1, mp), ()))
-        self.mul = P.Mul().shard(((dp, 1, mp), (dp, 1, mp)))
-
-    def construct(self, input_x):
-        x_dtype = self.dtype(input_x)
-        output = self.div(input_x, self.factor.astype(x_dtype))
-        output = self.add(self.erf(output), Tensor(1.0, x_dtype))
-        output = self.mul_const(self.mul(input_x, output), Tensor(0.5, x_dtype))
-        return output
 
 class ResidualAttentionBlock(nn.Cell):
     r"""
@@ -333,18 +394,20 @@ class ResidualAttentionBlock(nn.Cell):
         dp = config.parallel_config.data_parallel
         mp = config.parallel_config.model_parallel
         self.dtype = dtype
-        self.attn = MultiheadAttention(d_model, n_head, layers, dtype)
+        self.attn = MultiheadAttention(d_model, n_head, layers, config, dtype)
         self.ln_1 = LayerNorm((d_model,), eps=1e-6)
         self.ln_1.layer_norm.shard(((dp, 1, 1), (1,), (1,)))
         self.mlp = MLP(d_model, layers, dtype, config)
         self.ln_2 = LayerNorm((d_model,), eps=1e-6)
         self.ln_2.layer_norm.shard(((dp, 1, 1), (1,), (1,)))
         self.attn_mask = attn_mask
+        self.add = P.Add().shard(((dp, 1, mp), (dp, 1, mp)))
 
     def construct(self, input_x: ms.Tensor):
         r"""Construct"""
-        input_x = ops.Add()(input_x, self.attention(self.ln_1(input_x)))
-        input_x = ops.Add()(input_x, self.mlp(self.ln_2(input_x)))
+        # current (1, 1024, 1664)
+        input_x = self.add(input_x, self.attention(self.ln_1(input_x)))
+        input_x = self.add(input_x, self.mlp(self.ln_2(input_x)))
         return input_x
 
     def attention(self, input_x: ms.Tensor):
@@ -382,7 +445,7 @@ class QwenVL(BaseModel):
     def __init__(self, config: QwenVLConfig, **kwargs):
         super().__init__(config, **kwargs)
         self.config = config
-
+        parallel_config = config.parallel_config
         self.vision_encoder = VisionTransformer(config)
         self.llm_model = QwenForCausalLM(config.text_config)
 
@@ -396,11 +459,17 @@ class QwenVL(BaseModel):
         self.reshape = P.Reshape()
         self.ones_like = P.OnesLike()
         self.cast = P.Cast()
-        self.not_equal = P.NotEqual()
-        self.slice = P.StridedSlice()
-        self.masked_fill = P.MaskedFill()
-        self.tensor_scatter_update = ops.TensorScatterUpdate()
+
+        self.not_equal = P.NotEqual().shard(((parallel_config.data_parallel, 1), ()))
+        self.slice = P.StridedSlice().shard(((parallel_config.data_parallel, 1),))
+        self.masked_fill = P.MaskedFill().shard(((parallel_config.data_parallel, 1), (parallel_config.data_parallel, 1), ()))
+        self.tensor_scatter_update = ops.TensorScatterUpdate().shard(((1, 1, 1),
+                                                                      (1, 1, 1),
+                                                                      (1, 1, 1)))
         self.gather = P.Gather().shard(((1, 1, 1), ()))
+        self.equal = P.Equal().shard(((parallel_config.data_parallel, 1), ()))
+        self.assign = ops.Assign()
+        self.print = ops.Print()
 
         self.freeze_component()
 
@@ -466,11 +535,6 @@ class QwenVL(BaseModel):
         text_embeds = self.tensor_scatter_update(text_embeds, img_pos, image_embeds)
         return text_embeds
 
-    def generate_index(self, start):
-        indices = self.base_index.copy()
-        indices[:, 0] = indices[:, 0] + start
-        return indices
-
     def construct(self, input_ids, images, img_pos: Tensor = None, labels=None,
                   input_position=None, position_ids=None, attention_mask=None, init_reset=True, batch_valid_length=None,
                   batch_index=None, zactivate_len=None):
@@ -479,8 +543,10 @@ class QwenVL(BaseModel):
         if self.training:
             tokens = self.slice(input_ids, (0, 0), (bs, seq_len - 1), (1, 1))
             if labels is None:
-                labels = self.masked_fill(input_ids, input_ids == self.pad_token_id, self.ignore_token_id)
-                labels = self.masked_fill(labels, labels == self.image_pad_id, self.ignore_token_id)
+                pad_input_ids_pos = self.equal(input_ids, self.pad_token_id)
+                labels = self.masked_fill(input_ids, pad_input_ids_pos, self.ignore_token_id)
+                pad_label_pos = self.equal(labels, self.pad_token_id)
+                labels = self.masked_fill(labels, pad_label_pos, self.ignore_token_id)
         else:
             tokens = input_ids
 
