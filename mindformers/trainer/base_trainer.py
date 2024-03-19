@@ -975,14 +975,8 @@ class BaseTrainer:
             if config.load_checkpoint or config.only_save_strategy:
                 if ms.context.get_auto_parallel_context('parallel_mode') in \
                         ['semi_auto_parallel', 'auto_parallel', 'hybrid_parallel']:
-                    if network.config:
-                        batch_size = network.config.batch_size
-                        seq_length = network.config.seq_length
-                    else:
-                        batch_size = config.model.model_config.batch_size
-                        seq_length = config.model.model_config.seq_length
-                    infer_data = Tensor(shape=(batch_size, seq_length), dtype=ms.int32, init=init.One())
-                    transform_and_load_checkpoint(config, model, network, infer_data, do_predict=True)
+                    inputs = network.prepare_inputs_for_export(True)
+                    transform_and_load_checkpoint(config, model, network, inputs, do_predict=True)
                 else:
                     transform_and_load_checkpoint(config, model, network, None, do_predict=True)
 
