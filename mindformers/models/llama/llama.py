@@ -31,18 +31,21 @@ from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagati
 try:
     # pylint: disable=W0611
     from mindspore.ops.operations.nn_ops import PromptFlashAttention
+
     PFA_VALID = True
 except ImportError:
     PFA_VALID = False
 try:
     # pylint: disable=W0611
     from mindspore.ops.operations.nn_ops import IncreFlashAttention
+
     IFA_VALID = True
 except ImportError:
     IFA_VALID = False
 try:
     # pylint: disable=W0611
     from mindformers.modules.flash_attention import FlashAttention
+
     FLASHATTENTION_VALID = True
 except ImportError:
     FLASHATTENTION_VALID = False
@@ -56,7 +59,7 @@ from mindformers.tools.register.register import MindFormerModuleType, MindFormer
 from mindformers.version_control import check_valid_paged_attention, check_valid_flash_attention
 
 from .llama_config import LlamaConfig
-from .llama_layer import LlamaEmbedding, LlamaRMSNorm, FreqsMgr, CausalMask
+from .llama_layer import LlamaEmbedding, LlamaRMSNorm, FreqsMgr, CausalMask, FreqsMgrWithKBKInfer
 from .llama_transformer import LLamaDecodeLayer
 from ...modules import KVCachePreprocess
 from .llama_interleave import LLamaDecodeLayerInterleave
@@ -166,15 +169,18 @@ class LlamaModel(LlamaPreTrainedModel):
         self.expand_dims = P.ExpandDims()
         self.gather = P.Gather()
         self.slice = P.StridedSlice()
-
-        self.freqs_mgr = FreqsMgr(head_dim=self.head_dim,
-                                  seq_length=config.seq_length,
-                                  max_position_embedding=config.max_position_embedding,
-                                  rotary_dtype=config.rotary_dtype,
-                                  theta=config.theta,
-                                  scaling_factor=config.scaling_factor,
-                                  extend_method=config.extend_method,
-                                  is_dynamic=config.is_dynamic)
+        if self.use_kbk_infer:
+            self.freqs_mgr = FreqsMgrWithKBKInfer(dim=self.head_dim, base=config.theta,
+                                                  max_seq_len=config.max_position_embedding)
+        else:
+            self.freqs_mgr = FreqsMgr(head_dim=self.head_dim,
+                                      seq_length=config.seq_length,
+                                      max_position_embedding=config.max_position_embedding,
+                                      rotary_dtype=config.rotary_dtype,
+                                      theta=config.theta,
+                                      scaling_factor=config.scaling_factor,
+                                      extend_method=config.extend_method,
+                                      is_dynamic=config.is_dynamic)
         self.casual_mask = CausalMask(seq_length=config.seq_length,
                                       compute_type=config.compute_dtype,
                                       is_dynamic=config.is_dynamic,
@@ -245,7 +251,8 @@ class LlamaModel(LlamaPreTrainedModel):
                                 config.num_layers, select_recompute=config.parallel_config.recompute.select_recompute)
             self.layers.append(layer)
         self.norm_out = LlamaRMSNorm(config.hidden_size, config.rms_norm_eps,
-                                     compute_type=config.layernorm_compute_type, is_dynamic=config.is_dynamic, use_fusion_op=True)
+                                     compute_type=config.layernorm_compute_type, is_dynamic=config.is_dynamic,
+                                     use_fusion_op=True)
         self.kvcache_preprocess = KVCachePreprocess(max_batch_size=config.batch_size,
                                                     max_seq_length=config.seq_length,
                                                     is_dynamic=config.is_dynamic,
@@ -296,10 +303,17 @@ class LlamaModel(LlamaPreTrainedModel):
             kvcache_inputs = None
         else:
             if self.is_first_iteration:
-                freqs_cis = self.freqs_mgr(seq_len)
+                if self.use_kbk_infer:
+                    freqs_cis = self.freqs_mgr()
+                else:
+                    freqs_cis = self.freqs_mgr(seq_len)
+
                 mask = self.casual_mask(tokens)  # mask: [bs, seq, seq]
             else:
-                freqs_cis = self.freqs_mgr.increment(batch_valid_length, bs)
+                if self.use_kbk_infer:
+                    freqs_cis = self.freqs_mgr.increment(batch_valid_length)
+                else:
+                    freqs_cis = self.freqs_mgr.increment(batch_valid_length, bs)
                 if self.is_dynamic and self.is_flexible_shape and not self.use_kvcache_op:
                     mask = self.casual_mask.increment_slice(
                         self.kvcache_preprocess.range,

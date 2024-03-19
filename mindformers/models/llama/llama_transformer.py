@@ -29,13 +29,12 @@ from mindspore.ops import operations as P
 from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 
 from mindformers.models.llama.llama_layer import LlamaFeedForward, LlamaRMSNorm, LlamaRotaryEmbedding
-from mindformers.modules.layers import _check_input_dtype, Linear
+from mindformers.modules.layers import _check_input_dtype, Linear, LinearQkv
 from mindformers.modules.transformer import TransformerOpParallelConfig
 from mindformers.modules import KVCacheMgr, PagedAttentionMgr
 from mindformers.modules.flash_attention import FlashAttention
 from mindformers.modules.transformer.moe import MoEV2
 from mindformers.tools.logger import logger
-from mindformers.modules.layers import RotaryEmbedding
 from mindformers.modules.transformer import FlashAttentionScore
 
 
@@ -414,6 +413,23 @@ class LLamaAttention(nn.Cell):
         return attention_merge
 
 
+class RotaryEmbedding(nn.Cell):
+    """Rotary Embedding."""
+
+    def __init__(self, dim, base=10000, max_seq_len=2048, cos_format=0, rotary_half=False):
+        super(RotaryEmbedding, self).__init__()
+        self.apply_rotary_pos_emb = ops.ApplyRotaryPosEmb(cos_format)
+
+    def construct(self, query, key, cos, sin, position_ids):
+        query_embed, key_embed = self.apply_rotary_pos_emb(query, key, cos, sin, position_ids)
+        return query_embed, key_embed
+
+    def shard(self, parallel_config):
+        dp = parallel_config.data_parallel
+        mp = parallel_config.model_parallel
+        self.apply_rotary_pos_emb.shard(((dp, 1, mp), (dp, 1, mp), (1, 1), (1, 1), (dp,)))
+
+
 class LLamaAttentionWithKBKInfer(LLamaAttention):
     """LLamaAttentionWithKBKInfer"""
 
@@ -475,10 +491,18 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
                                                      num_blocks=self.num_blocks,
                                                      compute_dtype=compute_dtype,
                                                      input_layout="BSH")
-        
+
         self.flash_attention_score.shard(parallel_config)
         self.apply_rotary_pos_emb.shard(parallel_config)
         self.paged_attention_mgr.shard(parallel_config)
+        self.wqkv = LinearQkv(in_channels=self.hidden_size,
+                              out_channels_q=self.hidden_size,
+                              out_channels_k=self.kv_dim,
+                              out_channels_v=self.kv_dim,
+                              has_bias=qkv_has_bias,
+                              compute_dtype=compute_dtype,
+                              param_init_type=param_init_type,
+                              skip_redistribution=is_dynamic)
 
     def construct(self, x: Tensor, freqs_cis: Tuple[Tensor, Tensor], mask=None, kvcache_inputs=None):
         """Forward process of the MultiHeadAttention"""
@@ -486,19 +510,18 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
         # [bs, seq/1, hidden_dim]
         bs, seq_len, _ = self.shape(x)
         # [bs * seq/1, hidden_dim]
-        if self.qkv_concat:
-            x = self.reshape(x, (-1, x.shape[-1]))
-            bs_seq = x.shape[0]
-            qkv = self.cast(self.w(x), self.dtype)
-            query = self.slice_qkv(qkv, (0, 0), (bs_seq, self.hidden_size), (1, 1))
-            key = self.slice_qkv(qkv, (0, self.hidden_size),
-                                 (bs_seq, self.hidden_size + self.kv_dim), (1, 1))
-            value = self.slice_qkv(qkv, (0, self.hidden_size + self.kv_dim),
-                                   (bs_seq, self.hidden_size + self.kv_dim * 2), (1, 1))
-        else:
-            query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
-            key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
-            value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
+
+        # Linear
+        query = self.cast(self.wq(x), self.dtype)  # dp, 1 -> dp, mp
+        key = self.cast(self.wk(x), self.dtype)  # dp, 1 -> dp, mp
+        value = self.cast(self.wv(x), self.dtype)  # dp, 1 -> dp, mp
+
+        # LinearQKV
+        # qkv = self.wqkv(x)
+        # query = self.cast(qkv[0], self.dtype)
+        # key = self.cast(qkv[1], self.dtype)
+        # value = self.cast(qkv[2], self.dtype)
+
         batch_valid_length, block_tables, slot_mapping = kvcache_inputs
         # rope
         position_ids = None
@@ -508,7 +531,8 @@ class LLamaAttentionWithKBKInfer(LLamaAttention):
             position_ids = batch_valid_length
         query = self.reshape(query, (bs, seq_len, self.n_head * self.head_dim))
         key = self.reshape(key, (bs, seq_len, self.n_kv_head * self.head_dim))
-        query, key = self.apply_rotary_pos_emb(query, key, position_ids)
+        cos, sin = freqs_cis
+        query, key = self.apply_rotary_pos_emb(query, key, cos, sin, position_ids)
 
         if self.use_past:
             key_out = self.paged_attention_mgr(key, value, slot_mapping)
