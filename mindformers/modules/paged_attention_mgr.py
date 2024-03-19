@@ -78,7 +78,6 @@ class PagedAttentionMgr(nn.Cell):
         tmp_key = self.reshape(key, (-1, self.n_kv_heads, self.head_dim))
         tmp_value = self.reshape(value, (-1, self.n_kv_heads, self.head_dim))
         key_out = self.reshape_and_cache(tmp_key, tmp_value, self.key_cache, self.value_cache, slot_mapping)
-
         return key_out
 
     def paged_attn(self, query, batch_valid_length, block_tables):

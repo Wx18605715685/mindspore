@@ -102,6 +102,10 @@ class GenerationMixin:
     def slice_incremental_inputs(self, model_inputs: dict, current_index):
         """used for non-first iterations, slice the inputs to length 1."""
         input_ids = model_inputs.pop("input_ids")
+        if input_ids.shape[-1] == 1:
+            model_inputs["input_ids"] = input_ids
+            return
+
         if isinstance(input_ids, Tensor):
             input_ids = input_ids.asnumpy()
         inputs_tmp = []
@@ -257,10 +261,10 @@ class GenerationMixin:
         )
         return input_ids
 
-    def _incremental_infer(self, model_inputs: dict, current_index, valid_length_each_example):
+    def _incremental_infer(self, model_inputs: dict, prefill, current_index, valid_length_each_example):
         """model forward for incremental infer."""
         # Claim the first graph
-        if self.is_first_iteration:
+        if prefill:
             self.add_flags_recursive(is_first_iteration=True)
             model_inputs["input_position"] = Tensor(current_index, mstype.int32)
             model_inputs["init_reset"] = Tensor([False], mstype.bool_)  # init_reset (1,) bool False
@@ -296,12 +300,12 @@ class GenerationMixin:
     def is_kbk_infer(self):
         return hasattr(self.config, "use_kbk_infer") and self.config.use_kbk_infer
 
-    def _incremental_kbk_infer(self, model_inputs: dict, current_index, valid_length_each_example, block_tables,
+    def _incremental_kbk_infer(self, model_inputs: dict, prefill, current_index, valid_length_each_example, block_tables,
                                slot_mapping):
         """model forward for incremental infer."""
         # Claim the first graph
 
-        if self.is_first_iteration:
+        if prefill:
             self.phase = "full"
             self.add_flags_recursive(is_first_iteration=True)
             model_inputs["input_position"] = Tensor(current_index, mstype.int32)
@@ -416,6 +420,7 @@ class GenerationMixin:
             input_mask[i, :valid_length_each_example[i]] = 1
         encoder_output = None
         encoder_mask = None
+        target_mask = None
         if is_encoder_decoder:
             if generation_config.max_length > self.config.max_decode_length:
                 generation_config.max_length = self.config.max_decode_length
@@ -454,126 +459,41 @@ class GenerationMixin:
                 self.set_dynamic_inputs()
 
         while np.sum(is_finished) != batch_size:
-            forward_time = time.time()
-            seq_length = input_ids.shape[1]
-            current_index = [
-                valid_length_each_example[i] - 1 + i * seq_length
-                for i in range(batch_size)
-            ]
-            logger.debug("validate length: %s", valid_length_each_example)
             block_tables = None
             slot_mapping = None
             if self.is_kbk_infer():
                 block_tables, slot_mapping = block_mgr.assemble_pa_inputs(self.is_first_iteration,
                                                                           valid_length_each_example, is_finished)
-
-            if is_encoder_decoder:
-                inputs = Tensor(input_ids, mstype.int32)
-                # pylint: disable=E1102
-                res = self(
-                    input_ids=None,
-                    attention_mask=encoder_mask,
-                    encoder_outputs=encoder_output,
-                    decoder_input_ids=inputs,
-                    decoder_attention_mask=Tensor(target_mask, mstype.float32),
-                )
-            else:
-                model_kwargs["current_index"] = current_index
-                # model prepare input dict
-                model_inputs = self.prepare_inputs_for_generation(  # pylint: disable=E1111
-                    input_ids, **model_kwargs
-                )
-                # incremental generate
-                if generation_config.use_past:
-                    # when first iteration, gather last logits; others keep all logits.
-                    need_gather_logits = self.is_first_iteration
-                    # incremental generate
-                    if self.is_kbk_infer():
-                        start_time = time.time()
-                        res = self._incremental_kbk_infer(
-                            model_inputs=model_inputs,
-                            current_index=current_index,
-                            valid_length_each_example=valid_length_each_example,
-                            block_tables=block_tables,
-                            slot_mapping=slot_mapping
-                        )
-                        end_time = time.time()
-                        use_time = end_time - start_time
-                        logger.info("kbk infer batch valid length tokens: %s, incre time: %s s; ",
-                                    valid_length_each_example[0], use_time)
-                    else:
-                        res = self._incremental_infer(
-                            model_inputs=model_inputs,
-                            current_index=current_index,
-                            valid_length_each_example=valid_length_each_example
-                        )
-                # auto-aggressive generate
-                else:
-                    res = self(**model_inputs)  # pylint: disable=E1102
-            forward_time = time.time() - forward_time
-
-            search_time = time.time()
-            # post process logits; skip this phase if post process is done in graph
-            if not self.config.is_sample_acceleration:
-                # convert to numpy for post process
-                logits = res[0] if isinstance(res, tuple) else res
-                if isinstance(logits, Tensor):
-                    logits = logits.asnumpy()
-                logits = np.reshape(logits, (-1, logits.shape[-1]))
-                # need gather last seq logits using current_index
-                # compare length to determine if need gather; if not, gather should be done in model construct
-                if need_gather_logits and logits.shape[0] > len(current_index):
-                    logits = logits[current_index]
-
-                # post process logits, without changing logits shape and order
-                probs = logits_processor(input_ids, logits, is_finished)
-                p_args = np.tile(np.arange(logits.shape[-1]), (batch_size, 1))
-            else:
-                probs, p_args = res
-                if isinstance(probs, Tensor):
-                    probs = probs.asnumpy()
-                if isinstance(p_args, Tensor):
-                    p_args = p_args.asnumpy()
-            search_time = time.time() - search_time
-
-            update_time = time.time()
-
+            prefill = not generation_config.use_past or self.is_first_iteration
+            target_list, is_finished = self.infer(input_ids=input_ids,
+                                                  valid_length_each_example=valid_length_each_example,
+                                                  generation_config=generation_config,
+                                                  logits_processor=logits_processor,
+                                                  block_tables=block_tables,
+                                                  slot_mapping=slot_mapping,
+                                                  prefill=prefill,
+                                                  is_finished=is_finished,
+                                                  encoder_mask=encoder_mask,
+                                                  encoder_output=encoder_output,
+                                                  target_mask=target_mask,
+                                                  **model_kwargs)
             # Random select a token as final output for this round
-            target_list = [[] for _ in range(batch_size)]
             for i in range(batch_size):
                 if is_finished[i]:
                     continue
 
-                target_index = np.argmax(probs[i])
-
-                # get target token id
-                target = p_args[i][target_index]
-                input_ids[i, valid_length_each_example[i]] = target
-
-                if streamer is not None:
-                    # assign target element
-                    target_list[i] = [target]
-
+                input_ids[i, valid_length_each_example[i]] = target_list[i]
                 if is_encoder_decoder:
                     target_mask[i][valid_length_each_example[i]] = int(1)
 
                 valid_length_each_example[i] += int(1)
                 input_mask[i][valid_length_each_example[i] - 1] = 1
 
-                # Stop judgment
-                if p_args[i][target_index] == generation_config.eos_token_id \
-                        or valid_length_each_example[i] == generation_config.max_length:
-                    is_finished[i] = True
-                    continue
             if streamer is not None:
                 if batch_size == 1:
                     streamer.put(target_list[0])
                 else:
                     streamer.put(target_list)
-            update_time = time.time() - update_time
-            infer_time.append(forward_time)
-            logger.debug("forward time: %s s; greedy search time: %s s; update time: %s s; total count: %s s",
-                         forward_time, search_time, update_time, forward_time + search_time + update_time)
 
         # Return valid outputs out of padded outputs
         output_ids = []
@@ -598,7 +518,6 @@ class GenerationMixin:
                 origin_inputs,
                 generation_config: GenerationConfig,
                 logits_processor: Optional[LogitsProcessorList] = None,
-                logits_warper: Optional[LogitsProcessorList] = None,
                 streamer: BaseStreamer = None,
                 **model_kwargs):
         r"""
@@ -635,7 +554,6 @@ class GenerationMixin:
         prepare_time = time.time()
 
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
 
         if generation_config.pad_token_id is None:
             generation_config.pad_token_id = 0
@@ -680,6 +598,7 @@ class GenerationMixin:
             input_mask[i, :valid_length_each_example[i]] = 1
         encoder_output = None
         encoder_mask = None
+        target_mask = None
         if is_encoder_decoder:
             if generation_config.max_length > self.config.max_decode_length:
                 generation_config.max_length = self.config.max_decode_length
@@ -717,108 +636,32 @@ class GenerationMixin:
                 self.set_dynamic_inputs()
 
         while np.sum(is_finished) != batch_size:
-            forward_time = time.time()
-            seq_length = input_ids.shape[1]
-            current_index = [
-                valid_length_each_example[i] - 1 + i * seq_length
-                for i in range(batch_size)
-            ]
-            logger.debug("validate length: %s", valid_length_each_example)
-
             block_tables = None
             slot_mapping = None
             if self.is_kbk_infer():
                 block_tables, slot_mapping = block_mgr.assemble_pa_inputs(self.is_first_iteration,
                                                                           valid_length_each_example, is_finished)
-            if is_encoder_decoder:
-                inputs = Tensor(input_ids, mstype.int32)
-                # pylint: disable=E1102
-                res = self(
-                    input_ids=None,
-                    attention_mask=encoder_mask,
-                    encoder_outputs=encoder_output,
-                    decoder_input_ids=inputs,
-                    decoder_attention_mask=Tensor(target_mask, mstype.float32),
-                )
-            else:
-                model_kwargs["current_index"] = current_index
-                # model prepare input dict
-                model_inputs = self.prepare_inputs_for_generation(  # pylint: disable=E1111
-                    input_ids, **model_kwargs
-                )
-                # incremental generate
-                if generation_config.use_past:
-                    # when first iteration, gather last logits; others keep all logits.
-                    need_gather_logits = self.is_first_iteration
-                    # incremental generate
-                    if self.is_kbk_infer():
-                        start_time = time.time()
-                        res = self._incremental_kbk_infer(
-                            model_inputs=model_inputs,
-                            current_index=current_index,
-                            valid_length_each_example=valid_length_each_example,
-                            block_tables=block_tables,
-                            slot_mapping=slot_mapping
-                        )
-                        end_time = time.time()
-                        use_time = end_time - start_time
-                        logger.info("kbk infer batch valid length tokens: %s, incre time: %s s; ",
-                                    valid_length_each_example[0], use_time)
-                    else:
-                        res = self._incremental_infer(
-                            model_inputs=model_inputs,
-                            current_index=current_index,
-                            valid_length_each_example=valid_length_each_example
-                        )
-                # auto-aggressive generate
-                else:
-                    res = self(**model_inputs)  # pylint: disable=E1102
-            forward_time = time.time() - forward_time
 
-            sample_time = time.time()
-            # post process logits; skip this phase if post process is done in graph
-            if not self.config.is_sample_acceleration:
-                # convert to numpy for post process
-                logits = res[0] if isinstance(res, tuple) else res
-                if isinstance(logits, Tensor):
-                    logits = logits.asnumpy()
-                logits = np.reshape(logits, (-1, logits.shape[-1]))
-                # need gather last seq logits using current_index
-                # compare length to determine if need gather; if not, gather should be done in model construct
-                if need_gather_logits and logits.shape[0] > len(current_index):
-                    logits = logits[current_index]
-
-                # post process logits, without changing logits shape and order
-                probs = logits_processor(input_ids, logits, is_finished)
-                probs = logits_warper(input_ids, probs, is_finished)
-                p_args = np.tile(np.arange(logits.shape[-1]), (batch_size, 1))
-            else:
-                probs, p_args = res
-                if isinstance(probs, Tensor):
-                    probs = probs.asnumpy()
-                if isinstance(p_args, Tensor):
-                    p_args = p_args.asnumpy()
-            sample_time = time.time() - sample_time
-
-            update_time = time.time()
-            p_norms = softmax_with_threads(probs, is_finished)
+            prefill = not generation_config.use_past or self.is_first_iteration
+            target_list, is_finished = self.infer(input_ids=input_ids,
+                                                  valid_length_each_example=valid_length_each_example,
+                                                  generation_config=generation_config,
+                                                  logits_processor=logits_processor,
+                                                  block_tables=block_tables,
+                                                  slot_mapping=slot_mapping,
+                                                  prefill=prefill,
+                                                  is_finished=is_finished,
+                                                  encoder_mask=encoder_mask,
+                                                  encoder_output=encoder_output,
+                                                  target_mask=target_mask,
+                                                  **model_kwargs)
 
             # Random select a token as final output for this round
-            target_list = [[] for _ in range(batch_size)]
             for i in range(batch_size):
                 if is_finished[i]:
                     continue
 
-                p_norm = p_norms[i]
-                target_index = np.random.choice(len(probs[i]), p=p_norm)
-
-                # get target token id
-                target = p_args[i][target_index]
-                input_ids[i, valid_length_each_example[i]] = target
-
-                if streamer is not None:
-                    # assign target element
-                    target_list[i] = [target]
+                input_ids[i, valid_length_each_example[i]] = target_list[i]
 
                 if is_encoder_decoder:
                     target_mask[i][valid_length_each_example[i]] = int(1)
@@ -826,19 +669,11 @@ class GenerationMixin:
                 valid_length_each_example[i] += int(1)
                 input_mask[i][valid_length_each_example[i] - 1] = 1
 
-                # Stop judgment
-                if p_args[i][target_index] == generation_config.eos_token_id \
-                        or valid_length_each_example[i] == generation_config.max_length:
-                    is_finished[i] = True
-                    continue
             if streamer is not None:
                 if batch_size == 1:
                     streamer.put(target_list[0])
                 else:
                     streamer.put(target_list)
-            update_time = time.time() - update_time
-            logger.debug("forward time: %s s; sample time: %s s; update time: %s s; total count: %s s",
-                         forward_time, sample_time, update_time, forward_time + sample_time + update_time)
 
         # Return valid outputs out of padded outputs
         output_ids = []
@@ -1260,15 +1095,11 @@ class GenerationMixin:
             )
 
         elif generation_mode == GenerationMode.SAMPLE:
-            # prepare logits warper
-            logits_warper = self._get_logits_warper(generation_config)
-
             # run sample
             output_ids = self._sample(
                 origin_inputs=input_ids,
                 generation_config=generation_config,
                 logits_processor=logits_processor,
-                logits_warper=logits_warper,
                 streamer=streamer,
                 **model_kwargs,
             )
@@ -1296,3 +1127,224 @@ class GenerationMixin:
         # set to original phase
         self.set_train(origin_phase == "train")
         return output_ids
+
+    def infer(self,
+              input_ids: [Union[List[int], List[List[int]]]],
+              valid_length_each_example: [List[int]],
+              generation_config: [GenerationConfig] = None,
+              logits_processor: Optional[LogitsProcessorList] = None,
+              block_tables: Optional[Tensor] = None,
+              slot_mapping: Optional[Tensor] = None,
+              key_cache: Optional[Tensor] = None,
+              value_cache: Optional[Tensor] = None,
+              prefill: bool = None,
+              is_finished: List[bool] = None,
+              encoder_mask: Optional[Tensor] = None,
+              encoder_output: Optional[Tensor] = None,
+              target_mask: Optional[Tensor] = None,
+              **model_kwargs):
+        """do infer and return logits on next position, can choose do prefill or decode predict.
+            input_ids: input_ids after padding [bs, seq_length] or [seq_length]
+            valid_length_each_example: valid input length except padding
+            generation_configs: config include generation setting
+            logits_processor: Custom logits processors that complement the default logits processors built from arguments and
+                generation config. If a logit processor is passed that is already created with the arguments or a
+                generation config an error is thrown. This feature is intended for advanced users.
+            logits_warper: An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsWarper`] used
+                to warp the prediction score distribution of the language modeling head applied before multinomial
+                sampling at each generation step.
+            block_tables / slot_mapping: params for page attention
+            prefill: whether do prefill predict or decode predict
+            is_finished: model_origin_max_length or generating eod token
+            encoder_mask: use for encoder-decoder construct, do not need for decoder only construct
+            encoder_output: use for encoder-decoder construct, do not need for decoder only construct
+            target_mask: use for encoder-decoder construct, do not need for decoder only construct
+            return:
+                next_token, is_finished
+        """
+        # print(f"Begin to infer, and the config is: {self.config}, and the generation_config is: {generation_config}")
+        start_time = time.time()
+        input_ids = np.reshape(input_ids, (-1, np.shape(input_ids)[-1]))
+        batch_size = input_ids.shape[0]
+        seq_length = input_ids.shape[1]
+        current_index = [
+            valid_length_each_example[i] - 1 + i * seq_length
+            for i in range(batch_size)
+        ]
+        if self.config.is_encoder_decoder:
+            inputs = Tensor(input_ids, mstype.int32)
+            # pylint: disable=E1102
+            res = self(
+                input_ids=None,
+                attention_mask=encoder_mask,
+                encoder_outputs=encoder_output,
+                decoder_input_ids=inputs,
+                decoder_attention_mask=Tensor(target_mask, mstype.float32),
+            )
+        else:
+            model_kwargs["current_index"] = current_index
+            # model prepare input dict
+            model_inputs = self.prepare_inputs_for_generation(  # pylint: disable=E1111
+                input_ids, **model_kwargs
+            )
+            # incremental generate
+            if generation_config.use_past:
+                # when first iteration, gather last logits; others keep all logits.
+                # incremental generate
+                if self.config.use_kbk_infer:
+                    res = self._incremental_kbk_infer(
+                        model_inputs=model_inputs,
+                        prefill=prefill,
+                        current_index=current_index,
+                        valid_length_each_example=valid_length_each_example,
+                        block_tables=block_tables,
+                        slot_mapping=slot_mapping
+                    )
+                else:
+                    res = self._incremental_infer(
+                        model_inputs=model_inputs,
+                        prefill=prefill,
+                        current_index=current_index,
+                        valid_length_each_example=valid_length_each_example
+                    )
+            # auto-aggressive generate
+            else:
+                res = self(**model_inputs)  # pylint: disable=E1102
+        forward_time = time.time() - start_time
+
+        sample_time = time.time()
+        generation_mode = self._get_generation_mode(generation_config)
+        # print(f"The generation mode is: {generation_mode}")
+
+        need_gather_logits = prefill
+        if generation_mode == GenerationMode.SAMPLE:
+            logits_warper = self._get_logits_warper(generation_config)
+            # print(f"The logits_warper is: {logits_warper}")
+            logits_warper = logits_warper if logits_warper is not None else LogitsProcessorList()
+            next_id, is_finished = self.sampler(input_ids=input_ids,
+                                                is_finished=is_finished,
+                                                res=res,
+                                                generation_config=generation_config,
+                                                valid_length_each_example=valid_length_each_example,
+                                                current_index=current_index,
+                                                logits_processor=logits_processor,
+                                                logits_warper=logits_warper,
+                                                need_gather_logits=need_gather_logits)
+
+        elif generation_mode == GenerationMode.GREEDY_SEARCH:
+            next_id, is_finished = self.sampler(input_ids=input_ids,
+                                                is_finished=is_finished,
+                                                res=res,
+                                                generation_config=generation_config,
+                                                valid_length_each_example=valid_length_each_example,
+                                                current_index=current_index,
+                                                logits_processor=logits_processor,
+                                                need_gather_logits=need_gather_logits)
+
+        sample_time = time.time() - sample_time
+        infer_time = time.time() - start_time
+        logger.info("forward time: %s s; sample time: %s s; total count: %s s",
+                    forward_time, sample_time, infer_time)
+
+        return next_id, is_finished
+
+    def sampler(self,
+                input_ids,
+                is_finished,
+                res,
+                generation_config,
+                valid_length_each_example,
+                current_index: Optional[Union[List[int], List[List[int]]]] = None,
+                logits_processor: Optional[LogitsProcessorList] = None,
+                logits_warper: Optional[LogitsProcessorList] = None,
+                need_gather_logits: bool = True,
+                **model_kwargs):
+        """
+            input_ids: input_ids after padding [bsz, seq] or [seq,]
+            res: logits after infer [bs, seq, vocab_size] or [seq, vocab_size]
+            is_finished: [bsz,]
+            generation_mode: string, GREEDY_SEARCH\SAMPLE
+            need_gather_logits: whether gather result, when decode predict and is first iteration, set True.
+
+        """
+        batch_size = input_ids.shape[0]
+        target_list = [[] for _ in range(batch_size)]
+
+        # print(f"is_sample_acceleration: {self.config.is_sample_acceleration}")
+
+        if not self.config.is_sample_acceleration:  # 后处理不入图
+            # convert to numpy for post process
+            logits = res[0] if isinstance(res, tuple) else res
+            if isinstance(logits, Tensor):
+                logits = logits.asnumpy()
+            logits = np.reshape(logits, (-1, logits.shape[-1]))
+            # need gather last seq logits using current_index
+            # compare length to determine if need gather; if not, gather should be done in model construct
+            if need_gather_logits and logits.shape[0] > len(current_index):
+                logits = logits[current_index]
+
+        # print(f"The output logits of current idx: {current_index} is: {logits}")
+        # np.save(f"logits_{current_index[0]}.npy", logits)
+
+        generation_mode = self._get_generation_mode(generation_config)
+        if generation_mode == GenerationMode.GREEDY_SEARCH:
+            # run greedy search
+            if not self.config.is_sample_acceleration:
+                probs = logits_processor(input_ids, logits, is_finished)
+                p_args = np.tile(np.arange(logits.shape[-1]), (batch_size, 1))
+            else:
+                probs, p_args = res
+                if isinstance(probs, Tensor):
+                    probs = probs.asnumpy()
+                if isinstance(p_args, Tensor):
+                    p_args = p_args.asnumpy()
+
+            for i in range(batch_size):
+                if is_finished[i]:
+                    continue
+                target_index = np.argmax(probs[i])
+                # get target token id
+                target = p_args[i][target_index]
+                target_list[i] = target
+                # Stop judgment
+                if p_args[i][target_index] == generation_config.eos_token_id \
+                        or valid_length_each_example[i] == generation_config.max_new_tokens - 1:
+                    is_finished[i] = True
+
+        elif generation_mode == GenerationMode.SAMPLE:
+            if not self.config.is_sample_acceleration:
+                probs = logits_processor(input_ids, logits, is_finished)
+                # print(f"The probs after processor is: {probs}")
+                probs = logits_warper(input_ids, probs, is_finished)
+                # print(f"The probs after warper is: {probs}")
+                p_args = np.tile(np.arange(logits.shape[-1]), (batch_size, 1))
+                # print(f"The p_args is: {probs}")
+            else:
+                probs, p_args = res
+                if isinstance(probs, Tensor):
+                    probs = probs.asnumpy()
+                if isinstance(p_args, Tensor):
+                    p_args = p_args.asnumpy()
+            # print(f"The probs is: {probs}")
+            p_norms = softmax_with_threads(probs, is_finished)
+            # print(f"The p_norms is: {p_norms}")
+
+            for i in range(batch_size):
+                if is_finished[i]:
+                    continue
+                p_norm = p_norms[i]
+                target_index = np.random.choice(len(probs[i]), p=p_norm)
+                # print(f"The target_index is: {target_index}")
+                # get target token id
+                target = p_args[i][target_index]
+                target_list[i] = target
+                # print(f"The target is: {target}")
+                # Stop judgment
+                if p_args[i][target_index] == generation_config.eos_token_id \
+                        or valid_length_each_example[i] == generation_config.max_length - 1:
+                    is_finished[i] = True
+
+        elif generation_config.generation_mode == GenerationMode.BEAM_SEARCH:
+            raise ValueError("sampler method doesn't support BEAM_SEARCH. ")
+
+        return target_list, is_finished

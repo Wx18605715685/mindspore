@@ -113,7 +113,7 @@ class BaseModel(nn.Cell, GenerationMixin):
 
             param = replace_tk_to_mindpet(param)
             load_param_into_net(self, param)
-            logger.info("weights in %s are loaded", ckpt_file)
+            logger.info(f"weights in %s are loaded", ckpt_file)
         else:
             logger.info("model built, but weights is unloaded, since the config has no"
                         " checkpoint_name_or_path attribute or"
