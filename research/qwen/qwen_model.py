@@ -256,7 +256,7 @@ class QwenModel(BaseModel):
 
             from mindformers.models.llama.llama import layer_compute_dtype
             layer_compute_dtype(layer, layer_id, config.offset,
-                                config.parallel_config, config.num_layers)
+                                config.parallel_config, config.num_layers, config.parallel_config.recompute.select_recompute)
 
             self.layers.append(layer)
 
