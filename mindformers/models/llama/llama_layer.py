@@ -19,7 +19,7 @@ import numpy as np
 
 from mindspore.common.tensor import Tensor
 from mindspore.common.parameter import Parameter
-from mindspore import nn
+from mindspore import nn, ops
 import mindspore.common.dtype as mstype
 from mindspore.ops import operations as P
 from mindspore.ops import functional as F
@@ -57,7 +57,6 @@ class LlamaSiLU(Cell):
             Tensor. x = silu(x).
     """
 
-
     # pylint: disable=W0212
     def __init__(self):
         super().__init__()
@@ -90,6 +89,7 @@ class LlamaSiLU(Cell):
             moe_strategy = ((strategy.data_parallel, strategy.expert_parallel, 1, strategy.model_parallel),)
             self.shard(moe_strategy)
 
+
 def get_swap_mask(head_dim):
     """Swap matrix"""
     zero_block = np.zeros((head_dim // 2, head_dim // 2), dtype=np.float32)
@@ -112,16 +112,16 @@ def precompute_freqs_cis(
         ratio = end / pretrain_seqlen
     if extend_method == SeqExtendMethod.NTK.value:
         theta *= ratio
-    freqs_base = np.arange(0, dim, 2)[: (dim // 2)].astype(np.float32) # (head_dim // 2, )
-    freqs = 1.0 / (theta ** (freqs_base / dim)) # (head_dim // 2, )
+    freqs_base = np.arange(0, dim, 2)[: (dim // 2)].astype(np.float32)  # (head_dim // 2, )
+    freqs = 1.0 / (theta ** (freqs_base / dim))  # (head_dim // 2, )
     if extend_method == SeqExtendMethod.PI.value:
         t = np.arange(0, end / ratio, 1 / ratio).astype(np.float32)
     else:
         t = np.arange(0, end, 1).astype(np.float32)  # type: ignore # (seq_len,)
     freqs = np.outer(t, freqs)  # type: ignore (seq_len, head_dim // 2)
     emb = np.concatenate((freqs, freqs), axis=-1)
-    freqs_cos = np.cos(emb) # (seq_len, head_dim)
-    freqs_sin = np.sin(emb) # (seq_len, head_dim)
+    freqs_cos = np.cos(emb)  # (seq_len, head_dim)
+    freqs_sin = np.sin(emb)  # (seq_len, head_dim)
     freqs_cos = Tensor(freqs_cos, dtype=dtype)
     freqs_sin = Tensor(freqs_sin, dtype=dtype)
 
@@ -133,6 +133,7 @@ def precompute_freqs_cis(
 
 class FreqsMgr(Cell):
     r"""freqs_cis manager."""
+
     def __init__(self,
                  head_dim,
                  seq_length=None,
@@ -147,16 +148,16 @@ class FreqsMgr(Cell):
             max_position_embedding = seq_length
         if extend_method == SeqExtendMethod.NTK.value:
             theta *= scaling_factor
-        freqs_base = np.arange(0, head_dim, 2)[: (head_dim // 2)].astype(np.float32) # (head_dim // 2, )
-        freqs = 1.0 / (theta ** (freqs_base / head_dim)) # (head_dim // 2, )
+        freqs_base = np.arange(0, head_dim, 2)[: (head_dim // 2)].astype(np.float32)  # (head_dim // 2, )
+        freqs = 1.0 / (theta ** (freqs_base / head_dim))  # (head_dim // 2, )
         if extend_method == SeqExtendMethod.PI.value:
             t = np.arange(0, max_position_embedding / scaling_factor, 1 / scaling_factor).astype(np.float32)
         else:
             t = np.arange(0, max_position_embedding, 1).astype(np.float32)
         freqs = np.outer(t, freqs)  # (max_position_embedding, head_dim // 2)
         emb = np.concatenate((freqs, freqs), axis=-1)
-        freqs_cos = np.cos(emb) # (seq_len, head_dim)
-        freqs_sin = np.sin(emb) # (seq_len, head_dim)
+        freqs_cos = np.cos(emb)  # (seq_len, head_dim)
+        freqs_sin = np.sin(emb)  # (seq_len, head_dim)
         swap_mask = FreqsMgr.get_swap_mask(head_dim)
 
         self.head_dim = head_dim
@@ -191,6 +192,32 @@ class FreqsMgr(Cell):
         zero_block = np.zeros((head_dim // 2, head_dim // 2), dtype=np.float32)
         id_block = np.identity(head_dim // 2, dtype=np.float32)
         return np.block([[zero_block, id_block], [-id_block, zero_block]])
+
+
+class FreqsMgrWithKBKInfer(nn.Cell):
+    """Rotary Embedding."""
+
+    def __init__(self, dim, base=10000, max_seq_len=2048, cos_format=0):
+        super(FreqsMgrWithKBKInfer, self).__init__()
+        inv_freq = 1.0 / (base ** (np.arange(0, dim, 2).astype(np.float32) * (1 / dim)))
+        t = np.arange(max_seq_len, dtype=inv_freq.dtype)
+        freqs = np.outer(t, inv_freq)
+        if cos_format == 0:
+            emb = np.concatenate((freqs, freqs), axis=-1)
+        else:
+            freqs = np.expand_dims(freqs, 2)
+            emb = np.concatenate((freqs, freqs), axis=-1)
+            emb = emb.reshape(max_seq_len, dim)
+        self.cos = Tensor(np.cos(emb), dtype=mstype.float16)
+        self.sin = Tensor(np.sin(emb), dtype=mstype.float16)
+
+    def construct(self):
+        return self.cos, self.sin
+
+    def increment(self, batch_valid_length):
+        freqs_cos = ops.gather(self.cos, batch_valid_length, 0)
+        freqs_sin = ops.gather(self.sin, batch_valid_length, 0)
+        return freqs_cos, freqs_sin
 
 
 class LlamaRotaryEmbedding(Cell):
@@ -449,7 +476,7 @@ class LlamaFeedForward(Cell):
                 hidden_dim = int((ffn_dim_multiplier + 0.01) * hidden_dim)
             hidden_dim = int(2 * hidden_dim / 3)
             hidden_dim = multiple_of * \
-                ((hidden_dim + multiple_of - 1) // multiple_of)
+                         ((hidden_dim + multiple_of - 1) // multiple_of)
 
         self.dtype = compute_dtype
         self.hidden_act = hidden_act
@@ -489,10 +516,10 @@ class LlamaFeedForward(Cell):
         _check_input_dtype(F.dtype(x), "x", [mstype.float32, mstype.float16, mstype.bfloat16], self.cls_name)
         x = self.cast(x, self.dtype)
         # [bs, seq, hidden_dim] or [bs * seq, hidden_dim]
-        gate = self.w1(x) # dp,1 -> dp, mp
-        hidden = self.w3(x) # dp,1 -> dp, mp
-        hidden = self.mul(hidden, gate) # dp,mp -> dp, mp
-        output = self.w2(hidden) # dp,mp -> dp, 1
+        gate = self.w1(x)  # dp,1 -> dp, mp
+        hidden = self.w3(x)  # dp,1 -> dp, mp
+        hidden = self.mul(hidden, gate)  # dp,mp -> dp, mp
+        output = self.w2(hidden)  # dp,mp -> dp, 1
         return output
 
     def shard(self, parallel_config):
@@ -526,6 +553,7 @@ class LlamaFeedForward(Cell):
 
 class CausalMask(nn.Cell):
     r""" Get the Lower triangular matrix from the input_ids. """
+
     @_LogActionOnce(m_logger=logger, key='AttentionMask',
                     no_warning=_get_parallel_mode() in (ParallelMode.STAND_ALONE,))
     def __init__(self, seq_length, compute_type=mstype.float16,
