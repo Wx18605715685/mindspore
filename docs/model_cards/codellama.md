@@ -429,10 +429,6 @@ lr_schedule:
   lr_end: 0
   warmup_ratio: 0.03
   total_steps: -1 # -1 means it will load the total steps of the dataset
-
-# context
-context:
-  runtime_num_threads: 1
 ```
 
 - step3. 设置环境变量，变量配置如下：

@@ -1713,9 +1713,6 @@ baichuan2-13b在Atlas 800T A2上多机训练时，推荐使用流水线并行，
 ① 修改`run_baichuan2_13b_4096_910b.yaml`中提供的分布式训练配置
 
 ```yaml
-context:
-  runtime_num_threads: 1 # 新增配置
-
 parallel_config:
   data_parallel: 8
   model_parallel: 1

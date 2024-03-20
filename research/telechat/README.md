@@ -290,10 +290,6 @@ model:
     type: TelechatConfig
     batch_size: 1 # add for increase predict
     seq_length: 2048
-
-# context
-context:
-  runtime_num_threads: 1
 ```
 
 - step 3. 微调`telechat-7b`时修改并行策略配置，配置如下：

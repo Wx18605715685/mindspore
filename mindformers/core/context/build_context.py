@@ -18,6 +18,7 @@ import os
 from typing import Union
 import psutil
 
+import mindspore as ms
 import mindspore.dataset as ds
 from mindspore import context
 from mindspore.communication.management import init, get_group_size, get_rank
@@ -63,6 +64,11 @@ def build_context(config: Union[dict, MindFormerConfig, TrainingArguments]):
 
     if config.parallel.get("strategy_ckpt_load_file"):
         context.set_auto_parallel_context(strategy_ckpt_load_file=config.parallel.strategy_ckpt_load_file)
+
+    if config.context.get('runtime_num_threads') is None and ms.__version__ < "2.3":
+        context.set_context(runtime_num_threads=1)
+        logger.info("The current MindSpore version is %s,"
+                    "and set the default runtime_num_threads to 1.", ms.__version__)
 
 
 def cpu_affinity(rank_id, rank_size):

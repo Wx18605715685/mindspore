@@ -51,7 +51,6 @@ llama2_70b 待补充。
 | [llama2_13b](../../configs/llama2/run_llama2_13b_910b.yaml)             | text_generation       | wiki      | 4096      | -      | [train](#预训练)  | -           | 1658  tks/s/p |
 | [llama2_70b](../../configs/llama2/run_llama2_70b_910b.yaml)             | text_generation       | wiki      | 4096      | -      | [train](#预训练)  | -         | 406 tks/s/p |
 
-
 ## 仓库介绍
 
 `Llama 2` 基于 `mindformers` 实现，主要涉及的文件有：
@@ -572,10 +571,6 @@ model:
     type: LlamaConfig
     batch_size: 1 # add for increase predict
     seq_length: 2048
-
-# context
-context:
-  runtime_num_threads: 1
 ```
 
 >注意：alpaca数据集最长不超过2048，因此seq_length采用2048即可。
