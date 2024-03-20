@@ -1189,6 +1189,7 @@ class GenerationMixin:
                 # when first iteration, gather last logits; others keep all logits.
                 # incremental generate
                 if self.config.use_kbk_infer:
+                    start_time = time.time()
                     res = self._incremental_kbk_infer(
                         model_inputs=model_inputs,
                         prefill=prefill,
@@ -1197,6 +1198,10 @@ class GenerationMixin:
                         block_tables=block_tables,
                         slot_mapping=slot_mapping
                     )
+                    end_time = time.time()
+                    use_time = end_time - start_time
+                    logger.info("kbk infer batch valid length tokens: %s, incre time: %s s; ",
+                                valid_length_each_example[0], use_time)
                 else:
                     res = self._incremental_infer(
                         model_inputs=model_inputs,
