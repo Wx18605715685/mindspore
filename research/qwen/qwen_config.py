@@ -33,6 +33,13 @@ class QwenConfig(LlamaConfig):
 
     _support_list = MindFormerBook.get_config_support_list()['qwen']
 
-    def __init__(self, intermediate_size, **kwargs):
+    def __init__(self,
+                 intermediate_size,
+                 embedding_parallel_optimizer: bool = True,
+                 enable_slice_dp: bool = True,
+                 **kwargs):
         super(QwenConfig, self).__init__(**kwargs)
         self.intermediate_size = intermediate_size
+        self.embedding_parallel_optimizer = embedding_parallel_optimizer
+        self.enable_slice_dp = enable_slice_dp
+

@@ -91,6 +91,7 @@ class QwenForCausalLM(BaseModel):
         self.mul = P.Mul()
         self.sub_batch_valid_len = P.Sub()
         self.gather = P.Gather(1)
+        self.enable_slice_dp = config.enable_slice_dp
 
         if not (_get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation()):
             self.shard(config.parallel_config)
@@ -188,7 +189,10 @@ class QwenForCausalLM(BaseModel):
 
         dp = parallel_config.data_parallel
         mp = parallel_config.model_parallel
-        self.slice.shard(((dp, 1),))
+        if self.enable_slice_dp:
+            self.slice.shard(((dp, 1),))
+        else:
+            self.slice.shard(((1, 1),))
         self.not_equal.shard(((dp, 1), ()))
         self.mul.shard(((dp, 1), (dp, 1)))
         self.add.shard(((dp, 1), ()))
@@ -219,6 +223,7 @@ class QwenModel(BaseModel):
         self.is_dynamic = config.is_dynamic
         self.use_kvcache_op = config.use_kvcache_op
         self.is_flexible_shape = config.is_flexible_shape
+        embedding_parallel_optimizer = config.embedding_parallel_optimizer
 
         self.is_first_iteration = True
         self.use_flash_attention = config.use_flash_attention and FLASHATTENTION_VALID
@@ -229,7 +234,7 @@ class QwenModel(BaseModel):
 
         # 1. wte
         self.wte = LlamaEmbedding(self.vocab_size, self.embed_dim, param_init_type=config.param_init_type,
-                                  parallel_optimizer=True)
+                                  parallel_optimizer=embedding_parallel_optimizer)
 
         # 2. drop
         self.drop = nn.Dropout(p=config.emb_dropout_prob)
