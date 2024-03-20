@@ -58,7 +58,7 @@ train_dataset_task:
 # runner config
 runner_config:
   epochs: 5
-  batch_size: &batch_size 2
+  batch_size: &batch_size 4
   sink_mode: True
   sink_size: 2
 runner_wrapper:
@@ -112,10 +112,10 @@ micro_batch_interleave_num: &micro_batch_interleave_num 1
 # recompute config
 recompute_config:
   recompute: True
-  select_recompute: True
-  parallel_optimizer_comm_recompute: False
+  select_recompute: False
+  parallel_optimizer_comm_recompute: True
   mp_comm_recompute: False
-  recompute_slice_activation: False
+  recompute_slice_activation: True
 
 model:
   model_config:
@@ -151,6 +151,8 @@ model:
       num_heads: 32
       vocab_size: 151936
       intermediate_size: 11008
+      enable_slice_dp: False
+      embedding_parallel_optimizer: False
       rms_norm_eps: 1.0e-6
       emb_dropout_prob: 0.0
       eos_token_id: 151643
