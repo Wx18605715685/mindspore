@@ -305,22 +305,24 @@ class LlamaModel(LlamaPreTrainedModel):
             if self.is_first_iteration:
                 if self.use_kbk_infer:
                     freqs_cis = self.freqs_mgr()
+                    mask = None
                 else:
                     freqs_cis = self.freqs_mgr(seq_len)
 
-                mask = self.casual_mask(tokens)  # mask: [bs, seq, seq]
+                    mask = self.casual_mask(tokens)  # mask: [bs, seq, seq]
             else:
                 if self.use_kbk_infer:
                     freqs_cis = self.freqs_mgr.increment(batch_valid_length)
+                    mask = None
                 else:
                     freqs_cis = self.freqs_mgr.increment(batch_valid_length, bs)
-                if self.is_dynamic and self.is_flexible_shape and not self.use_kvcache_op:
-                    mask = self.casual_mask.increment_slice(
-                        self.kvcache_preprocess.range,
-                        self.kvcache_preprocess.max_cache_length // bs, batch_valid_length,
-                        zactivate_len)
-                else:
-                    mask = self.casual_mask.increment(self.kvcache_preprocess.range, batch_valid_length, zactivate_len)
+                    if self.is_dynamic and self.is_flexible_shape and not self.use_kvcache_op:
+                        mask = self.casual_mask.increment_slice(
+                            self.kvcache_preprocess.range,
+                            self.kvcache_preprocess.max_cache_length // bs, batch_valid_length,
+                            zactivate_len)
+                    else:
+                        mask = self.casual_mask.increment(self.kvcache_preprocess.range, batch_valid_length, zactivate_len)
 
             kvcache_inputs = self.kvcache_preprocess(bs, batch_valid_length, batch_index, zactivate_len,
                                                      block_tables, slot_mapping)
