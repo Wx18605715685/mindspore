@@ -464,7 +464,8 @@ class GenerationMixin:
                 block_tables, slot_mapping = block_mgr.assemble_pa_inputs(self.is_first_iteration,
                                                                           valid_length_each_example, is_finished)
             prefill = not generation_config.use_past or self.is_first_iteration
-            target_list, is_finished = self.infer(input_ids=input_ids,
+            use_past_prefill = generation_config.use_past and self.is_first_iteration
+            target_list, is_finished = self.infer(input_ids=origin_inputs if use_past_prefill else input_ids,
                                                   valid_length_each_example=valid_length_each_example,
                                                   generation_config=generation_config,
                                                   logits_processor=logits_processor,
@@ -1310,7 +1311,7 @@ class GenerationMixin:
                 target_list[i] = target
                 # Stop judgment
                 if p_args[i][target_index] == generation_config.eos_token_id \
-                        or valid_length_each_example[i] == generation_config.max_new_tokens - 1:
+                        or valid_length_each_example[i] == generation_config.max_length - 1:
                     is_finished[i] = True
 
         elif generation_mode == GenerationMode.SAMPLE:
