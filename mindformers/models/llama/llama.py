@@ -469,8 +469,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         dynamic_input_ids = Tensor(shape=[None, None], dtype=ms.int32)
         dynamic_input_position = Tensor(shape=[None], dtype=ms.int32)
         dynamic_init_reset = Tensor([False], mstype.bool_)
-        dynamic_batch_valid_length = Tensor(shape=[None, None], dtype=ms.int64)
-        dynamic_block_tables = Tensor(shape=[None, None], dtype=ms.int64)
+        dynamic_batch_valid_length = Tensor(shape=[None, None], dtype=ms.int32)
+        dynamic_block_tables = Tensor(shape=[None, None], dtype=ms.int32)
         dynamic_slot_mapping = Tensor(shape=[None], dtype=ms.int32)
         self.set_inputs(dynamic_input_ids, None, dynamic_input_position, None, None, None, dynamic_init_reset,
                         dynamic_batch_valid_length, None, None, dynamic_block_tables, dynamic_slot_mapping)
